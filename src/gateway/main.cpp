@@ -33,6 +33,29 @@
 #define PREFIJO_TRAMA               "{\"id\":\""
 
 // ---------------------------------------------------------------------------
+// MODO DE PRUEBA
+// Con 1, el gateway fabrica una trama sintetica cada PRUEBA_PERIODO_MS y la
+// manda al agente como si hubiera llegado por LoRa. Sirve para probar la nube
+// con una sola placa, sin el emisor. Las tramas LoRa reales se siguen
+// recibiendo. Tambien se activa sin tocar el codigo con -DMODO_PRUEBA=1.
+//
+// Usa el mismo id que el emisor para caer en la misma entidad de Orion; los
+// datos sinteticos se reconocen por rssi/snr en null. Al terminar la prueba,
+// volver a 0 (o borrar esos registros en la nube).
+// ---------------------------------------------------------------------------
+#ifndef MODO_PRUEBA
+#define MODO_PRUEBA                 0
+#endif
+
+#if MODO_PRUEBA
+#define PRUEBA_ID                   "461879"
+#define PRUEBA_PERIODO_MS           10000UL
+#define PRUEBA_LAT                  6.245259
+#define PRUEBA_LON                  -75.596510
+static unsigned long enviadas_prueba = 0;
+#endif
+
+// ---------------------------------------------------------------------------
 // COLA DE REENVIO
 // Buffer circular: si se llena, se descarta la trama mas vieja. Con una trama
 // cada 10 s, 20 huecos aguantan unos 3 minutos sin WiFi.
@@ -90,12 +113,74 @@ static void conectarWiFi()
     ultimo_wifi_ms = millis();
 }
 
-// Lee un paquete LoRa si lo hay, separa el id del resto, le agrega rssi/snr y
-// lo mete en la cola.
+// El id viaja en la URL sin codificar: solo se aceptan caracteres que no
+// necesitan escaparse, para que un id raro no pueda meter "&k=..." en la URL.
+static bool idValido(const char *id, size_t len)
+{
+    for (size_t i = 0; i < len; i++) {
+        if (!isalnum((unsigned char)id[i]) && id[i] != '-' && id[i] != '_') {
+            return false;
+        }
+    }
+    return true;
+}
+
+// Valida una trama con formato LoRa, separa el id del resto, le agrega la
+// calidad de la senal y la mete en la cola. "calidad" son los campos
+// rssi/snr ya formateados, p. ej.  "rssi":-87,"snr":9.5
+static void encolarTrama(const char *trama, int n, const char *calidad)
+{
+    const size_t prefijo = strlen(PREFIJO_TRAMA);
+    if (n < 2 || strncmp(trama, PREFIJO_TRAMA, prefijo) != 0 || trama[n - 1] != '}') {
+        Serial.println("  -> no es una trama nuestra, se ignora");
+        return;
+    }
+
+    // trama = {"id":"461879",<resto>}
+    //                ^id     ^cierre
+    const char *id     = trama + prefijo;
+    const char *cierre = strchr(id, '"');
+    size_t id_len = cierre ? (size_t)(cierre - id) : 0;
+    if (id_len == 0 || id_len >= ID_MAX || cierre[1] != ',' || !idValido(id, id_len)) {
+        Serial.println("  -> trama sin id valido, se ignora");
+        return;
+    }
+    const char *resto = cierre + 2;
+    int resto_len = (int)((trama + n - 1) - resto);   // sin la llave de cierre
+    if (resto_len <= 0) {
+        Serial.println("  -> trama sin medidas, se ignora");
+        return;
+    }
+
+    // El id va a la URL; el cuerpo es el resto con rssi/snr al final.
+    Medida *m = encolar();
+    memcpy(m->id, id, id_len);
+    m->id[id_len] = '\0';
+    snprintf(m->cuerpo, sizeof(m->cuerpo), "{%.*s,%s}", resto_len, resto, calidad);
+}
+
+// Lee un paquete LoRa si lo hay y lo pasa a encolarTrama() con su rssi/snr.
+//
+// La radio queda en recepcion continua (LoRa.receive()) y aqui solo se mira el
+// pin DIO0, que el SX1276 sube al terminar de recibir un paquete. No se sondea
+// con parsePacket() a secas: en esta libreria deja la radio en recepcion
+// "single", que a los ~400 ms sin paquete pasa a reposo y no vuelve a escuchar
+// hasta la siguiente llamada. Mientras un POST bloquea (hasta ~5 s si la nube
+// no contesta) la radio estaria sorda, justo cuando la cola deberia proteger
+// los datos. En continuo, la radio sigue escuchando sola durante el POST.
 static void recibirLoRa()
 {
+    if (digitalRead(RADIO_DIO0_PIN) == LOW) {
+        return;
+    }
+
+    // parsePacket() limpia la bandera RxDone y deja la radio en reposo: hay que
+    // leer el paquete y despues volver a recepcion continua.
     int tam = LoRa.parsePacket();
     if (tam == 0) {
+        // DIO0 subio pero el paquete llego con CRC malo: la libreria lo descarta.
+        Serial.println("LoRa RX: paquete con CRC malo, descartado");
+        LoRa.receive();
         return;
     }
 
@@ -108,37 +193,45 @@ static void recibirLoRa()
 
     int   rssi = LoRa.packetRssi();
     float snr  = LoRa.packetSnr();
+    LoRa.receive();
+
     recibidas++;
     ultimo_rssi = rssi;
     oled_sucio = true;
 
     Serial.printf("LoRa RX (%d bytes, RSSI %d, SNR %.1f): %s\n", n, rssi, snr, trama);
 
-    const size_t prefijo = strlen(PREFIJO_TRAMA);
-    if (n < 2 || strncmp(trama, PREFIJO_TRAMA, prefijo) != 0 || trama[n - 1] != '}') {
-        Serial.println("  -> no es una trama nuestra, se ignora");
-        return;
-    }
-
-    // trama = {"id":"461879",<resto>}
-    //                ^id     ^cierre
-    const char *id     = trama + prefijo;
-    const char *cierre = strchr(id, '"');
-    size_t id_len = cierre ? (size_t)(cierre - id) : 0;
-    if (id_len == 0 || id_len >= ID_MAX || cierre[1] != ',') {
-        Serial.println("  -> trama sin id valido, se ignora");
-        return;
-    }
-    const char *resto = cierre + 2;
-    int resto_len = (int)((trama + n - 1) - resto);   // sin la llave de cierre
-
-    // El id va a la URL; el cuerpo es el resto con rssi/snr al final.
-    Medida *m = encolar();
-    memcpy(m->id, id, id_len);
-    m->id[id_len] = '\0';
-    snprintf(m->cuerpo, sizeof(m->cuerpo), "{%.*s,\"rssi\":%d,\"snr\":%.1f}",
-             resto_len, resto, rssi, snr);
+    char calidad[32];
+    snprintf(calidad, sizeof(calidad), "\"rssi\":%d,\"snr\":%.1f", rssi, snr);
+    encolarTrama(trama, n, calidad);
 }
+
+#if MODO_PRUEBA
+// Arma una trama con el mismo formato que la del emisor y la pasa por el mismo
+// camino que una recibida por LoRa (validacion incluida). Los valores varian un
+// poco de una trama a otra para que en las graficas se vea que llegan nuevas.
+// rssi/snr van como null: no hubo radio, y un 0 pareceria una medida real.
+static void generarTramaPrueba()
+{
+    static unsigned long ultima_ms = 0;
+    if (enviadas_prueba != 0 && millis() - ultima_ms < PRUEBA_PERIODO_MS) {
+        return;
+    }
+    ultima_ms = millis();
+
+    char trama[LORA_MAX_PAYLOAD + 1];
+    int n = snprintf(trama, sizeof(trama),
+                     "{\"id\":\"%s\",\"n\":%lu,\"t\":%.2f,\"h\":%.2f,\"lat\":%.6f,\"lon\":%.6f}",
+                     PRUEBA_ID, enviadas_prueba,
+                     22.0 + (enviadas_prueba % 10) * 0.1,
+                     60.0 + (enviadas_prueba % 7) * 0.5,
+                     PRUEBA_LAT, PRUEBA_LON);
+    Serial.printf("PRUEBA: trama sintetica %s\n", trama);
+    encolarTrama(trama, n, "\"rssi\":null,\"snr\":null");
+    enviadas_prueba++;
+    oled_sucio = true;
+}
+#endif
 
 // Intenta mandar la trama mas vieja de la cola. Devuelve true si la nube la
 // acepto (respuesta 2xx).
@@ -211,7 +304,12 @@ static void refrescarOled()
         snprintf(buf, sizeof(buf), "WiFi: desconectado");
     }
     u8g2->drawStr(0, 12, buf);
+#if MODO_PRUEBA
+    // En modo prueba se cambia esta linea para que no se olvide activado.
+    snprintf(buf, sizeof(buf), "PRUEBA: %lu  RX: %lu", enviadas_prueba, recibidas);
+#else
     snprintf(buf, sizeof(buf), "RX: %lu  RSSI: %d", recibidas, ultimo_rssi);
+#endif
     u8g2->drawStr(0, 26, buf);
     snprintf(buf, sizeof(buf), "Nube: %lu  HTTP: %d", reenviadas, ultimo_http);
     u8g2->drawStr(0, 40, buf);
@@ -239,6 +337,15 @@ void setup()
     mostrarConfigRadio();
     Serial.printf("Destino: http://%s:%d/iot/json?k=%s&i=<id>\n",
                   AGENTE_HOST, AGENTE_PUERTO, AGENTE_APIKEY);
+
+    // Recepcion continua; recibirLoRa() solo mira DIO0 (ver alli el porque).
+    pinMode(RADIO_DIO0_PIN, INPUT);
+    LoRa.receive();
+
+#if MODO_PRUEBA
+    Serial.printf("*** MODO PRUEBA: trama sintetica cada %lu ms con id %s ***\n",
+                  PRUEBA_PERIODO_MS, PRUEBA_ID);
+#endif
 }
 
 void loop()
@@ -246,6 +353,9 @@ void loop()
     static wl_status_t wifi_previo = WL_IDLE_STATUS;
 
     recibirLoRa();
+#if MODO_PRUEBA
+    generarTramaPrueba();
+#endif
 
     wl_status_t wifi = WiFi.status();
     if (wifi != wifi_previo) {
@@ -258,6 +368,10 @@ void loop()
         oled_sucio = true;
     }
     if (wifi != WL_CONNECTED && millis() - ultimo_wifi_ms > WIFI_REINTENTO_MS) {
+        // El codigo ayuda a diagnosticar: 1 = SSID no encontrado (nombre mal o
+        // red solo de 5 GHz), 4 = fallo de conexion, 0/6 = no termino de
+        // conectar (con clave mala el ESP32 suele quedarse en 6).
+        Serial.printf("WiFi: sin conexion (estado %d), reintentando\n", wifi);
         WiFi.disconnect();
         conectarWiFi();
     }

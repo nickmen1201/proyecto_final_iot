@@ -87,8 +87,8 @@ static bool   dato_gps_valido  = false;
 #define NUM_MUESTRAS                3
 #define MUESTRA_GAP_MS              200UL
 
-// Rangos fisicos del HDC1080. Una lectura fuera de ellos es un error de bus
-// (p. ej. 125 C / 100 % cuando el sensor devuelve 0xFFFF), no una medida.
+// Rangos fisicos del HDC1080. Las lecturas fallidas del bus ya llegan como NAN
+// (ver leerCrudoHdc), esto es una segunda barrera contra valores absurdos.
 #define TEMP_MIN                    -40.0
 #define TEMP_MAX                    125.0
 #define HUM_MIN                     0.0
@@ -100,6 +100,10 @@ static uint8_t muestra_idx = 0;         // lecturas tomadas en este ciclo
 
 // La trama vive entre BUNDLING (que la arma) y SEND (que la transmite).
 static char payload[LORA_MAX_PAYLOAD + 1];
+static bool payload_listo = false;      // false si no cupo: no se transmite
+
+// El NEO-6M manda posicion cada segundo; una de mas de 3 s ya no es actual.
+#define GPS_EDAD_MAX_MS             3000UL
 
 
 static void smartDelay(unsigned long ms)
@@ -135,6 +139,52 @@ static void reiniciarBusI2C()
     Serial.printf("I2C: bus reiniciado, HDC1080 %s\n", sensor_ok ? "OK" : "SIN RESPUESTA");
 }
 
+// La libreria ClosedCube tampoco avisa cuando una lectura falla: si el sensor no
+// contesta, Wire.read() devuelve -1, la libreria lo arma como 0xFFFF y eso da
+// 124.997 C / 99.998 %, que caen DENTRO del rango fisico y pasarian el filtro.
+// Por eso el registro se lee aqui comprobando cada paso del bus.
+#define HDC1080_REG_TEMPERATURA     0x00
+#define HDC1080_REG_HUMEDAD         0x01
+#define HDC1080_CONVERSION_MS       9       // 14 bits tarda ~6.5 ms (datasheet)
+
+static bool leerCrudoHdc(uint8_t registro, uint16_t &crudo)
+{
+    // Escribir el puntero dispara la conversion.
+    Wire.beginTransmission(HDC1080_ADDR);
+    Wire.write(registro);
+    if (Wire.endTransmission() != 0) {
+        return false;
+    }
+    delay(HDC1080_CONVERSION_MS);
+    if (Wire.requestFrom((uint8_t)HDC1080_ADDR, (uint8_t)2) != 2) {
+        return false;
+    }
+    uint8_t msb = Wire.read();
+    uint8_t lsb = Wire.read();
+    crudo = ((uint16_t)msb << 8) | lsb;
+    // Los 2 bits bajos estan reservados y el sensor siempre los manda en 0:
+    // si vienen en 1, el dato no salio del sensor (bus flotando en alto).
+    return (crudo & 0x03) == 0;
+}
+
+// Una lectura fallida vuelve como NAN, que enRango() rechaza siempre.
+static double leerTemperatura()
+{
+    uint16_t crudo;
+    return leerCrudoHdc(HDC1080_REG_TEMPERATURA, crudo)
+           ? (crudo / 65536.0) * 165.0 - 40.0
+           : NAN;
+}
+
+static double leerHumedad()
+{
+    uint16_t crudo;
+    return leerCrudoHdc(HDC1080_REG_HUMEDAD, crudo)
+           ? (crudo / 65536.0) * 100.0
+           : NAN;
+}
+
+// Cualquier comparacion con NAN da false, asi que NAN nunca esta en rango.
 static bool enRango(double v, double minimo, double maximo)
 {
     return v > minimo && v < maximo;
@@ -172,8 +222,8 @@ static void estadoChirp()
         return;
     }
 
-    muestras_temp[muestra_idx] = sensor.readTemperature();
-    muestras_hum[muestra_idx]  = sensor.readHumidity();
+    muestras_temp[muestra_idx] = leerTemperatura();
+    muestras_hum[muestra_idx]  = leerHumedad();
     Serial.printf("Muestra %d: T=%.2f  H=%.2f\n", muestra_idx + 1,
                   muestras_temp[muestra_idx], muestras_hum[muestra_idx]);
     muestra_idx++;
@@ -239,13 +289,20 @@ static void estadoPrunning()
 // ---------------------------------------------------------------------------
 static void estadoGps()
 {
-    dato_gps_valido = gps.location.isValid();
+    // TinyGPSPlus nunca invalida la posicion: si se pierde el fix, isValid()
+    // sigue en true con la ultima posicion conocida. Se exige ademas que sea
+    // reciente; si no, se manda null como cuando no hay fix.
+    dato_gps_valido = gps.location.isValid() &&
+                      gps.location.age() < GPS_EDAD_MAX_MS;
 
     if (dato_gps_valido) {
         dato_latitud  = gps.location.lat();
         dato_longitud = gps.location.lng();
         Serial.printf("---- GPS: lat=%.6f lon=%.6f (%u satelites)\n",
                       dato_latitud, dato_longitud, gps.satellites.value());
+    } else if (gps.location.isValid()) {
+        Serial.printf("---- GPS: fix perdido hace %lu ms (%u satelites), se enviara null\n",
+                      (unsigned long)gps.location.age(), gps.satellites.value());
     } else {
         Serial.printf("---- GPS: sin fix todavia (%u satelites), se enviara null\n",
                       gps.satellites.value());
@@ -282,8 +339,11 @@ static void estadoBundling()
     Serial.printf("---- BUNDLING: %d bytes ----\n", total);
     Serial.println(payload);
 
-    if (total > LORA_MAX_PAYLOAD) {
-        Serial.printf("---- AVISO: %d bytes superan los %d de LoRa, la trama va truncada\n",
+    // Una trama truncada es JSON roto: el gateway la descartaria igual, asi que
+    // ni se gasta aire en ella.
+    payload_listo = (total > 0 && total <= LORA_MAX_PAYLOAD);
+    if (!payload_listo) {
+        Serial.printf("---- ERROR: %d bytes superan los %d de LoRa, la trama no se envia\n",
                       total, LORA_MAX_PAYLOAD);
     }
 
@@ -297,9 +357,12 @@ static void estadoBundling()
 // ---------------------------------------------------------------------------
 static void estadoSend()
 {
-    LoRa.beginPacket();
-    LoRa.print(payload);
-    bool enviado = (LoRa.endPacket() == 1);
+    bool enviado = false;
+    if (payload_listo) {
+        LoRa.beginPacket();
+        LoRa.print(payload);
+        enviado = (LoRa.endPacket() == 1);
+    }
 
     Serial.println(enviado ? "---- SEND: trama enviada por LoRa ----"
                            : "---- SEND: FALLO la transmision LoRa ----");
