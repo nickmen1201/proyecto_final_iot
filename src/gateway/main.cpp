@@ -87,6 +87,19 @@ static int           ultimo_http = 0;
 static int           ultimo_rssi = 0;
 static bool          oled_sucio  = true;
 
+// Mientras secrets.h tenga el SSID de la plantilla, el gateway solo escucha
+// LoRa: asi se puede probar el enlace sin nube y sin un log lleno de
+// reintentos de WiFi.
+static const bool wifi_configurado = strcmp(WIFI_SSID, "nombre-de-la-red") != 0;
+
+// Para detectar tramas perdidas con el campo n del emisor.
+static long ultimo_n = -1;
+
+// Cada cuanto se imprime que la radio sigue escuchando, para distinguir "no
+// llega nada" de "el gateway se colgo".
+#define LATIDO_MS                   10000UL
+static unsigned long ultimo_latido_ms = 0;
+
 // Reserva el siguiente hueco de la cola y lo devuelve para rellenarlo.
 static Medida *encolar()
 {
@@ -153,34 +166,50 @@ static void encolarTrama(const char *trama, int n, const char *calidad)
     }
 
     // El id va a la URL; el cuerpo es el resto con rssi/snr al final.
-    Medida *m = encolar();
-    memcpy(m->id, id, id_len);
-    m->id[id_len] = '\0';
-    snprintf(m->cuerpo, sizeof(m->cuerpo), "{%.*s,%s}", resto_len, resto, calidad);
+    Medida m;
+    memcpy(m.id, id, id_len);
+    m.id[id_len] = '\0';
+    snprintf(m.cuerpo, sizeof(m.cuerpo), "{%.*s,%s}", resto_len, resto, calidad);
+    Serial.printf("  -> para el agente: i=%s  %s\n", m.id, m.cuerpo);
+
+    // Sin WiFi configurado no hay a donde mandarla: encolarla solo llenaria la
+    // cola y el log de "COLA: llena".
+    if (!wifi_configurado) {
+        return;
+    }
+    *encolar() = m;
+}
+
+// Compara el campo n con el de la trama anterior para ver si se perdio alguna
+// en el aire. Si n baja, el emisor se reinicio (su contador vuelve a 0).
+static void revisarSecuencia(const char *trama)
+{
+    const char *campo = strstr(trama, "\"n\":");
+    if (!campo) {
+        return;
+    }
+    long n = atol(campo + 4);
+    if (ultimo_n >= 0) {
+        if (n == ultimo_n + 1) {
+            Serial.println("  -> secuencia OK");
+        } else if (n > ultimo_n + 1) {
+            Serial.printf("  -> PERDIDAS %ld trama(s) entre n=%ld y n=%ld\n",
+                          n - ultimo_n - 1, ultimo_n, n);
+        } else {
+            Serial.printf("  -> n bajo de %ld a %ld: el emisor se reinicio\n", ultimo_n, n);
+        }
+    }
+    ultimo_n = n;
 }
 
 // Lee un paquete LoRa si lo hay y lo pasa a encolarTrama() con su rssi/snr.
-//
-// La radio queda en recepcion continua (LoRa.receive()) y aqui solo se mira el
-// pin DIO0, que el SX1276 sube al terminar de recibir un paquete. No se sondea
-// con parsePacket() a secas: en esta libreria deja la radio en recepcion
-// "single", que a los ~400 ms sin paquete pasa a reposo y no vuelve a escuchar
-// hasta la siguiente llamada. Mientras un POST bloquea (hasta ~5 s si la nube
-// no contesta) la radio estaria sorda, justo cuando la cola deberia proteger
-// los datos. En continuo, la radio sigue escuchando sola durante el POST.
+// parsePacket() se llama en cada pasada de loop(): asi es como la libreria
+// espera que se use. Limitacion conocida: mientras un POST bloquea, la radio
+// puede dejar de escuchar y perder una trama.
 static void recibirLoRa()
 {
-    if (digitalRead(RADIO_DIO0_PIN) == LOW) {
-        return;
-    }
-
-    // parsePacket() limpia la bandera RxDone y deja la radio en reposo: hay que
-    // leer el paquete y despues volver a recepcion continua.
     int tam = LoRa.parsePacket();
     if (tam == 0) {
-        // DIO0 subio pero el paquete llego con CRC malo: la libreria lo descarta.
-        Serial.println("LoRa RX: paquete con CRC malo, descartado");
-        LoRa.receive();
         return;
     }
 
@@ -193,17 +222,29 @@ static void recibirLoRa()
 
     int   rssi = LoRa.packetRssi();
     float snr  = LoRa.packetSnr();
-    LoRa.receive();
-
     recibidas++;
     ultimo_rssi = rssi;
     oled_sucio = true;
 
-    Serial.printf("LoRa RX (%d bytes, RSSI %d, SNR %.1f): %s\n", n, rssi, snr, trama);
+    Serial.printf("\nLoRa RX #%lu (%d bytes, RSSI %d dBm, SNR %.1f dB): %s\n",
+                  recibidas, n, rssi, snr, trama);
+    revisarSecuencia(trama);
 
     char calidad[32];
     snprintf(calidad, sizeof(calidad), "\"rssi\":%d,\"snr\":%.1f", rssi, snr);
     encolarTrama(trama, n, calidad);
+}
+
+// Sin pantalla, este latido es lo que confirma que el gateway sigue vivo y
+// escuchando aunque no llegue nada.
+static void latido()
+{
+    if (millis() - ultimo_latido_ms < LATIDO_MS) {
+        return;
+    }
+    ultimo_latido_ms = millis();
+    Serial.printf("[escuchando LoRa... recibidas: %lu, ultimo RSSI: %d]\n",
+                  recibidas, ultimo_rssi);
 }
 
 #if MODO_PRUEBA
@@ -325,9 +366,15 @@ void setup()
     // setupBoards() levanta un punto de acceso abierto llamado "T-Beam". Aqui
     // la placa tiene que ser cliente de la red WiFi, no punto de acceso.
     WiFi.softAPdisconnect(true);
-    WiFi.mode(WIFI_STA);
-    WiFi.setAutoReconnect(true);
-    conectarWiFi();
+    if (wifi_configurado) {
+        WiFi.mode(WIFI_STA);
+        WiFi.setAutoReconnect(true);
+        conectarWiFi();
+    } else {
+        WiFi.mode(WIFI_OFF);
+        Serial.println("WiFi: secrets.h tiene la red de ejemplo, el gateway solo "
+                       "escucha LoRa (no reenvia a la nube)");
+    }
 
     Serial.println("Gateway LoRa -> HTTP");
     if (!iniciarRadio()) {
@@ -337,10 +384,6 @@ void setup()
     mostrarConfigRadio();
     Serial.printf("Destino: http://%s:%d/iot/json?k=%s&i=<id>\n",
                   AGENTE_HOST, AGENTE_PUERTO, AGENTE_APIKEY);
-
-    // Recepcion continua; recibirLoRa() solo mira DIO0 (ver alli el porque).
-    pinMode(RADIO_DIO0_PIN, INPUT);
-    LoRa.receive();
 
 #if MODO_PRUEBA
     Serial.printf("*** MODO PRUEBA: trama sintetica cada %lu ms con id %s ***\n",
@@ -353,9 +396,14 @@ void loop()
     static wl_status_t wifi_previo = WL_IDLE_STATUS;
 
     recibirLoRa();
+    latido();
 #if MODO_PRUEBA
     generarTramaPrueba();
 #endif
+
+    if (!wifi_configurado) {
+        return;
+    }
 
     wl_status_t wifi = WiFi.status();
     if (wifi != wifi_previo) {
