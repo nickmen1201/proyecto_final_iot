@@ -34,6 +34,8 @@
 int counter = 0;
 
 TinyGPSPlus gps;
+// Campo 3 de $GPGSV: satelites a la vista (el NEO-6M usa el prefijo GP).
+TinyGPSCustom satelites_visibles(gps, "GPGSV", 3);
 ClosedCube_HDC1080 sensor;
 // setupBoards() ya abre el UART del GPS (Serial1, 9600 baudios, pines de la placa).
 HardwareSerial &comunicacion_gps = SerialGPS;
@@ -307,6 +309,20 @@ static void estadoGps()
         Serial.printf("---- GPS: sin fix todavia (%u satelites), se enviara null\n",
                       gps.satellites.value());
     }
+
+    // "Sin fix" puede ser falta de cielo o que el modulo no este mandando
+    // nada. Estos contadores lo distinguen: si caracteres no sube, no llegan
+    // datos por el UART; si sube pero no hay frases validas, llegan en otro
+    // formato o a otra velocidad.
+    // gps.satellites cuenta solo los satelites USADOS en el fix (0 hasta que lo
+    // hay). Los VISIBLES salen de la frase GSV y muestran si el modulo ya esta
+    // viendo cielo aunque todavia no tenga posicion.
+    Serial.printf("     GPS: %s satelites visibles\n",
+                  satelites_visibles.isValid() ? satelites_visibles.value() : "0");
+    Serial.printf("     GPS UART: %lu caracteres, %lu frases OK, %lu con checksum malo\n",
+                  (unsigned long)gps.charsProcessed(),
+                  (unsigned long)gps.passedChecksum(),
+                  (unsigned long)gps.failedChecksum());
 
     estado = ESTADO_BUNDLING;
 }
