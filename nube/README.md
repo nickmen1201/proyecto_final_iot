@@ -216,12 +216,38 @@ curl -s "http://localhost:1026/v2/entities/urn:ngsi-ld:SensorAgricola:461879?att
   -H "fiware-service: agricultura" -H "fiware-servicepath: /"
 ```
 
-⏳ PENDIENTE: el método y la URL exactos que usa el agente para hablar con
-Orion. El agente ya tiene `IOTA_LOG_LEVEL=DEBUG`, así que basta con encender
-el gateway y buscar la petición en el log:
+**Método que usa el agente: `POST /v2/entities?options=upsert`.** Así consta
+en el log de Orion, que registra cada petición recibida. Esta es la última
+medida guardada (`172.18.0.6` es el contenedor del agente):
+
+```
+time=2026-10-16T20:50:01.841Z | from=172.18.0.6 | srv=agricultura | subsrv=/ |
+msg=Request received: POST /v2/entities?options=upsert, request payload (751 bytes):
+{"id":"urn:ngsi-ld:SensorAgricola:461879","type":"SensorAgricola",
+ "numeroTrama":{"type":"Integer","value":579,...},"temperatura":{...},
+ "humedad":{...},"rssi":{...},"snr":{...},"TimeInstant":{...}},
+response code: 204
+```
+
+Según la [especificación NGSI-v2](https://fiware.github.io/specifications/ngsiv2/stable/),
+`options=upsert` significa lo siguiente:
+
+- Si la entidad **no existe**, la crea y responde `201 Created`.
+- Si **ya existe**, la actualiza: agrega o modifica los atributos que vengan
+  en la petición y deja los demás como estaban. Responde `204 No Content`.
+
+Todas las medidas responden **204**, es decir, son actualizaciones y no
+creaciones. Solo la primera medida, la del 2026-10-16 a las 18:18:41, creó la
+entidad. Esto coincide con que `dateCreated` no cambie.
+
+Además, en el cuerpo no vienen `latitud` ni `longitud`: el agente omite los
+campos que llegan como `null`.
+
+Para repetir la consulta en la EC2:
 
 ```bash
-docker compose logs -f iot-agent | grep -iE "context broker|v2/(entities|op)"
+cd ~/fiware
+docker compose logs --no-color orion | grep "Request received" | grep -v " GET " | tail -5
 ```
 
 #### d) Orion → QuantumLeap → CrateDB: el histórico
