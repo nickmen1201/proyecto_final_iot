@@ -4,3 +4,6 @@
 .vscode/launch.json
 .vscode/ipch
 include/secrets.h
+
+# clave de Postgres y dominio del front (compose de nube/)
+nube/.env

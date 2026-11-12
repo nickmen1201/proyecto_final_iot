@@ -13,6 +13,11 @@
 # Mongo 8 no abre datos de 6.0 y CrateDB 6 no lee tablas creadas en 4.x: al
 # migrar se borran los volumenes (docker compose down -v) y se vuelve a
 # correr provisionamiento.sh. El historico anterior no se conserva.
+#
+# Capa curada y de decisiones (2026-11-11): postgres + limpiar + analitica +
+# api + front. Requiere un archivo .env junto a este compose (no va a Git):
+#   PG_PASSWORD=<una clave>
+#   DOMINIO=34-237-180-187.sslip.io   (sin definir: localhost, para pruebas)
 
 services:
   # Estado actual de las entidades (NGSI-v2).
@@ -85,6 +90,75 @@ services:
     volumes:
       - crate-db:/data
 
+  # ------------------------------------------------------------------
+  # Capa curada y de decisiones. Ver nube/servicios/ y nube/README.md.
+  # ------------------------------------------------------------------
+
+  # Datos curados, indicadores y decisiones. Sin puerto publicado.
+  postgres:
+    image: postgres:18.6
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: agricultura
+      POSTGRES_USER: agro
+      POSTGRES_PASSWORD: ${PG_PASSWORD:?definir PG_PASSWORD en nube/.env}
+    volumes:
+      # en la imagen 18 el volumen es /var/lib/postgresql (no .../data)
+      - postgres:/var/lib/postgresql
+      - ./servicios/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+
+  # CrateDB (crudo) -> Postgres (medidas_limpias).
+  # Unico servicio con "build": analitica y api reusan la misma imagen
+  # (construirla tres veces en paralelo hace que el build falle por carrera).
+  limpiar:
+    build: ./servicios
+    image: fiware-servicios
+    command: python limpiar.py
+    restart: unless-stopped
+    depends_on: [crate-db, postgres]
+    environment:
+      PG_PASSWORD: ${PG_PASSWORD}
+      TZ: America/Bogota
+
+  # CrateDB (crudo) -> resumen_horario, indicadores y decisiones (R1..R5).
+  analitica:
+    image: fiware-servicios
+    command: python analitica.py
+    restart: unless-stopped
+    depends_on: [crate-db, postgres]
+    environment:
+      PG_PASSWORD: ${PG_PASSWORD}
+      TZ: America/Bogota
+      SIN_DATOS_MIN: ${SIN_DATOS_MIN:-5}
+
+  # Consulta Postgres y Orion para el front. Solo accesible via Caddy.
+  api:
+    image: fiware-servicios
+    command: uvicorn api:app --host 0.0.0.0 --port 8000
+    restart: unless-stopped
+    depends_on: [postgres, orion]
+    environment:
+      PG_PASSWORD: ${PG_PASSWORD}
+      TZ: America/Bogota
+
+  # Pagina estatica + proxy de /api/*. Unico servicio nuevo expuesto:
+  # Caddy consigue y renueva solo el certificado TLS del DOMINIO.
+  front:
+    image: caddy:2.11.9
+    restart: unless-stopped
+    depends_on: [api]
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      DOMINIO: ${DOMINIO:-localhost}
+    volumes:
+      - ./front:/srv:ro
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy:/data
+
 volumes:
   mongo-db:
   crate-db:
+  postgres:
+  caddy:

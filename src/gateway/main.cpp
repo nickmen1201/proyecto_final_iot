@@ -262,7 +262,7 @@ static void generarTramaPrueba()
 
     char trama[LORA_MAX_PAYLOAD + 1];
     int n = snprintf(trama, sizeof(trama),
-                     "{\"id\":\"%s\",\"n\":%lu,\"t\":%.2f,\"h\":%.2f,\"lat\":%.6f,\"lon\":%.6f}",
+                     "{\"id\":\"%s\",\"n\":%lu,\"t\":%.2f,\"h\":%.2f,\"lat\":%.6f,\"lon\":%.6f,\"v\":3}",
                      PRUEBA_ID, enviadas_prueba,
                      22.0 + (enviadas_prueba % 10) * 0.1,
                      60.0 + (enviadas_prueba % 7) * 0.5,

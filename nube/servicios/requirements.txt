@@ -1,0 +1,5 @@
+requests==2.34.2
+psycopg[binary]==3.3.8
+fastapi==0.162.5
+uvicorn==0.54.0
+tzdata==2026.6

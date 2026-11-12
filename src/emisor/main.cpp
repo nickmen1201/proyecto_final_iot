@@ -19,17 +19,24 @@
 
 // Formato de la trama (JSON en una sola linea):
 //
-//   {"id":"461879","n":12,"t":22.41,"h":61.30,"lat":6.245259,"lon":-75.596510}
+//   {"id":"461879","n":12,"t":22.41,"h":61.30,"lat":6.245259,"lon":-75.596510,"v":3}
 //
 //   n   -> numero de trama. Permite detectar en la nube tramas perdidas.
 //   t   -> temperatura del aire en C (promedio de las muestras del ciclo)
 //   h   -> humedad relativa del aire en %
 //   lat/lon -> posicion GPS
+//   v   -> mascara de validez: bit 1 = aire (t/h), bit 2 = GPS.
+//          (bits 4 y 8 reservados para los sensores de luz y de suelo)
 //
 // Un dato que no es valido en este ciclo (sensor ausente o GPS sin fix) viaja
 // como null, no como cero: un 0.0 de relleno se confundiria con una medida real
 // (0 C es una temperatura posible y 0,0 es un punto real del mapa). Filtrar los
 // null es trabajo del servicio de limpieza en la nube.
+//
+// "v" existe porque los null no llegan al historico: el IoT Agent omite los
+// campos null, Orion conserva el valor viejo del atributo y QuantumLeap guarda
+// la entidad completa. Sin "v", una fila de CrateDB con el valor repetido seria
+// indistinguible de una medida real.
 
 int counter = 0;
 
@@ -348,9 +355,11 @@ static void estadoBundling()
         snprintf(campo_lon, sizeof(campo_lon), "%.6f", dato_longitud);
     }
 
+    int validez = (dato_temp_valido ? 1 : 0) | (dato_gps_valido ? 2 : 0);
+
     int total = snprintf(payload, sizeof(payload),
-                         "{\"id\":\"%s\",\"n\":%d,\"t\":%s,\"h\":%s,\"lat\":%s,\"lon\":%s}",
-                         DEVICE_ID, counter, campo_t, campo_h, campo_lat, campo_lon);
+                         "{\"id\":\"%s\",\"n\":%d,\"t\":%s,\"h\":%s,\"lat\":%s,\"lon\":%s,\"v\":%d}",
+                         DEVICE_ID, counter, campo_t, campo_h, campo_lat, campo_lon, validez);
 
     Serial.printf("---- BUNDLING: %d bytes ----\n", total);
     Serial.println(payload);

@@ -16,9 +16,14 @@ marcado con ⏳ **PENDIENTE**.
 | Archivo | Para qué sirve |
 |---|---|
 | `README.md` | Esta documentación |
-| [`docker-compose.yml`](docker-compose.yml) | Definición de los 5 servicios. Es la copia de `~/fiware/docker-compose.yml`. |
-| [`provisionamiento.sh`](provisionamiento.sh) | Crea el service group, el dispositivo y la suscripción. Solo hace falta para montar la plataforma desde cero. |
+| [`docker-compose.yml`](docker-compose.yml) | Definición de los 10 servicios. En la EC2 vive en `~/fiware`, junto con el resto de esta carpeta. |
+| [`provisionamiento.sh`](provisionamiento.sh) | Crea el service group, los dispositivos (el real y `simulado-01`) y la suscripción. Solo hace falta para montar la plataforma desde cero. |
+| [`servicios/`](servicios/) | Limpiar, Analítica y API: una sola imagen de Python con un script por servicio, más [`init.sql`](servicios/init.sql) con el esquema de Postgres |
+| [`front/index.html`](front/index.html) | El tablero web: semáforo de decisiones, gráficas y mapa |
+| [`Caddyfile`](Caddyfile) | Caddy en 80/443: sirve el front, hace proxy de `/api/*` y gestiona el certificado TLS |
+| [`simular.sh`](simular.sh) | Manda tramas como el gateway para probar la plataforma y disparar las reglas sin hardware |
 | [`recolectar_info.sh`](recolectar_info.sh) | Script de solo lectura que vuelca la configuración y el estado de la EC2 |
+| `.env` (no va a Git) | `PG_PASSWORD` y `DOMINIO`, junto al compose |
 
 ---
 
@@ -39,6 +44,13 @@ flowchart LR
         QL["QuantumLeap<br/>1.0.0"]
         CRATE[("CrateDB<br/>6.5.1")]
     end
+    subgraph Decision["Capa curada y de decisiones (misma EC2)"]
+        LIMPIAR["Limpiar"]
+        ANALITICA["Analítica<br/>R1..R5"]
+        PG[("Postgres<br/>18.6")]
+        API["API<br/>FastAPI"]
+        FRONT["Front<br/>Caddy 80/443"]
+    end
     E -- "LoRa 915 MHz<br/>JSON" --> G
     G -- "HTTP POST :5555<br/>JSON" --> IOTA
     IOTA -- "HTTP NGSI-v2 :1026" --> ORION
@@ -46,6 +58,13 @@ flowchart LR
     ORION -. "base orion-agricultura<br/>estado actual y suscripción" .-> MONGO
     ORION -- "suscripción<br/>HTTP NGSI-v2 :8668" --> QL
     QL -- "HTTP SQL :4200" --> CRATE
+    CRATE -- "crudo" --> LIMPIAR
+    CRATE -- "crudo" --> ANALITICA
+    LIMPIAR -- "medidas_limpias" --> PG
+    ANALITICA -- "resumen, indicadores,<br/>decisiones" --> PG
+    PG --> API
+    ORION -- "estado actual" --> API
+    API --> FRONT
 ```
 
 ### Componentes
@@ -59,6 +78,11 @@ flowchart LR
 | MongoDB | `mongo:8.0` | Base de datos de Orion y del IoT Agent | [MongoDB 8.0](https://www.mongodb.com/docs/v8.0/) |
 | QuantumLeap | `orchestracities/quantumleap:1.0.0` | Recibe las notificaciones de Orion y guarda cada cambio como una serie de tiempo | [QuantumLeap](https://quantumleap.readthedocs.io/) |
 | CrateDB | `crate:6.5.1` | Base de datos SQL donde QuantumLeap guarda el **histórico** | [CrateDB](https://cratedb.com/docs/crate/reference/en/latest/) |
+| Limpiar | `fiware-servicios` propia ([servicios/limpiar.py](servicios/limpiar.py)) | Lee el crudo de CrateDB, descarta lo inválido (validez, rangos, saltos) y guarda `medidas_limpias` en Postgres | — |
+| Analítica | la misma imagen ([servicios/analitica.py](servicios/analitica.py)) | Agregados por hora, indicadores (VPD, punto de rocío, tendencia, GDD) y las reglas de decisión R1–R5 | — |
+| Postgres | `postgres:18.6` | Base de datos curada: medidas limpias, resumen, indicadores y decisiones | [PostgreSQL 18](https://www.postgresql.org/docs/18/) |
+| API | la misma imagen ([servicios/api.py](servicios/api.py)) | Endpoints `/api/*` para el front; consulta Postgres y el estado actual de Orion | [FastAPI](https://fastapi.tiangolo.com/) |
+| Front | `caddy:2.11.9` + [front/index.html](front/index.html) | Tablero web en 80/443 con TLS automático de Let's Encrypt | [Caddy](https://caddyserver.com/docs/) |
 
 ### Infraestructura
 
@@ -67,11 +91,11 @@ flowchart LR
 | Proveedor | AWS EC2 (AWS Academy Learner Lab), Ubuntu |
 | IP pública | `34.237.180.187`. No cambió al detener y volver a iniciar la instancia, así que se comporta como una Elastic IP. |
 | Acceso SSH | Usuario `ubuntu`, par de claves `vockey` (`labsuser.pem`), o EC2 Instance Connect desde la consola |
-| Carpeta del compose | `~/fiware` (solo contiene `docker-compose.yml`) |
+| Carpeta del compose | `~/fiware`: una copia de esta carpeta `nube/` (compose, servicios, front, Caddyfile y `.env`) |
 | Docker | Engine 29.9.1, Compose v5.6.0. Se usa `docker compose`, con espacio. |
 | Arranque automático | Sí. El servicio `docker` está `enabled` y los 5 contenedores tienen `restart: unless-stopped`, así que al iniciar la EC2 todo se levanta solo. |
 | Persistencia | Volúmenes `fiware_mongo-db` y `fiware_crate-db`. Los datos sobreviven a reinicios y a `docker compose down`, pero **no** a `docker compose down -v`. |
-| Visualización | Consola web de CrateDB (`http://34.237.180.187:4200`), consultando con SQL la tabla `mtagricultura.etsensoragricola` |
+| Visualización | El front (`https://34-237-180-187.sslip.io`). La consola web de CrateDB (`http://34.237.180.187:4200`) queda para inspeccionar el crudo. |
 
 ### Puertos
 
@@ -81,6 +105,7 @@ lo publica en la EC2 y el Security Group lo permite.
 | Puerto | Servicio | Publicado por Docker | Abierto en el Security Group | Para qué |
 |---|---|---|---|---|
 | 22 | SSH (la EC2) | — | Sí, `0.0.0.0/0` | Administración: SSH y EC2 Instance Connect |
+| 80 / 443 | Front (Caddy) | Sí | **Hay que abrirlos**, `0.0.0.0/0` | El tablero web. El 80 solo redirige al 443 y responde el reto de Let's Encrypt. |
 | 5555 | IoT Agent | Sí | Sí, `0.0.0.0/0` | **Southbound**: entrada HTTP de medidas desde el gateway (`IOTA_HTTP_PORT`) |
 | 4200 | CrateDB | Sí | Solo `200.3.144.141/32` | API HTTP/SQL y consola web, donde se visualizan los datos |
 | 4041 | IoT Agent | Sí | **No** | **Northbound**: API de administración, para crear service groups y dispositivos (`IOTA_NORTH_PORT`) |
@@ -89,6 +114,8 @@ lo publica en la EC2 y el Security Group lo permite.
 | 27017 | MongoDB | No | No | Solo accesible dentro de la red `fiware_default` |
 | 8668 | QuantumLeap | No | No | Recibe notificaciones de Orion. Su API de consulta del histórico solo es accesible dentro de Docker. |
 | 4300 / 5432 | CrateDB | No | No | Comunicación entre nodos / protocolo PostgreSQL |
+| 5432 | Postgres | No | No | Solo lo usan Limpiar, Analítica y la API dentro de Docker |
+| 8000 | API | No | No | Solo la alcanza Caddy, que publica `/api/*` en 443 |
 
 Security Group `sg-0da85f7226698e695` (`launch-wizard-6`), reglas de entrada
 consultadas el 2026-10-21. La instancia no tiene rol de IAM.
@@ -327,6 +354,45 @@ curl -s -X POST localhost:4200/_sql -H "Content-Type: application/json" -d '{"st
 
 También se puede usar la consola web de CrateDB en `http://34.237.180.187:4200`.
 
+#### e) CrateDB → Limpiar / Analítica → Postgres → API → Front: las decisiones
+
+Esta es la capa que convierte las medidas en **recomendaciones**. Los tres
+servicios son scripts de Python sobre una misma imagen
+([`servicios/`](servicios/)) y comparten las reglas de limpieza
+([`comun.py`](servicios/comun.py)), para que nadie decida sobre datos sucios:
+
+1. **Limpiar** (cada 60 s, incremental con marca de agua) descarta las tramas
+   del modo de prueba, aplica la máscara `validez` del emisor (un bit apagado
+   significa que Orion repitió el valor viejo, no que hubo medida), filtra
+   rangos físicos y saltos imposibles (>5 °C entre tramas separadas <60 s), y
+   guarda `medidas_limpias` en Postgres.
+2. **Analítica** (cada 60 s) produce tres niveles sobre la ventana de CrateDB:
+   - *Descriptivo* — `resumen_horario`: mínimo, máximo y promedio de T y HR,
+     tramas recibidas y perdidas (huecos del contador `n`), RSSI/SNR.
+   - *Predictivo* — `indicadores`: **VPD** (déficit de presión de vapor),
+     **punto de rocío**, **tendencia de T** (regresión sobre 60 min, solo con
+     ≥30 min de datos) con la predicción a 1 h, **grados-día** y pérdida de
+     tramas.
+   - *Prescriptivo* — `decisiones`: las reglas **R1 estrés hídrico (VPD), R2
+     riesgo de hongos (T−Td, HR sostenida), R3 helada (actual y prevista), R4
+     estrés térmico y R5 salud del sistema**. Cada decisión lleva nivel
+     (OK/ATENCIÓN/CRÍTICO/SIN_DATOS), acción recomendada y la evidencia en
+     JSON. Se evalúa sobre ventanas (no lecturas sueltas), con histéresis, y
+     solo se inserta fila cuando una regla cambia de nivel. Si no llegan datos
+     frescos, R5 pasa a CRÍTICO y las demás dicen SIN_DATOS, nunca "todo bien".
+     Los umbrales son los del tomate y viven en un diccionario
+     ([`analitica.py`](servicios/analitica.py)).
+3. **API** expone `/api/decisiones`, `/api/indicadores`, `/api/resumen`,
+   `/api/medidas`, `/api/actual` (este último consulta a Orion, la línea de
+   retorno del tablero) y `/api/salud`.
+4. **Front**: [una sola página](front/index.html) con el semáforo R1–R5, las
+   gráficas de T/punto de rocío y VPD con sus umbrales, el historial de
+   decisiones y el mapa. Caddy la sirve en 80/443 con certificado automático.
+
+Para probar sin hardware: [`simular.sh`](simular.sh) envía tramas como el
+gateway (dispositivo `simulado-01`, una entidad aparte) con escenarios que
+disparan cada regla: `normal`, `calor` (R1/R4), `hongos` (R2) y `helada` (R3).
+
 ### Qué almacena cada servicio
 
 | Servicio | Dónde | Qué guarda |
@@ -334,6 +400,8 @@ También se puede usar la consola web de CrateDB en `http://34.237.180.187:4200`
 | IoT Agent | MongoDB, base `iotagentjson`, colecciones `groups`, `devices` y `commands` | Service group, dispositivo con su mapeo de atributos y la última medida recibida (`oldCtxt`) |
 | Orion | MongoDB, base `orion-agricultura`, colecciones `entities` y `csubs` | Estado actual de la entidad (1 documento) y la suscripción |
 | QuantumLeap | CrateDB, tabla `mtagricultura.etsensoragricola` | Histórico: una fila por cada notificación |
+| Limpiar y Analítica | Postgres, base `agricultura` ([esquema](servicios/init.sql)) | `medidas_limpias`, `resumen_horario`, `indicadores`, `decisiones` y `marca_agua` |
+| Caddy | Volumen `caddy` | El certificado TLS, para no pedirlo de nuevo en cada arranque |
 | Gateway | RAM de la placa | Cola circular de 20 tramas cuando no hay red. Se pierde si la placa se reinicia. |
 
 ### Chequeos de salud

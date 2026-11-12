@@ -1,0 +1,277 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Agricultura IoT</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.4/chart.umd.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+<style>
+  :root {
+    color-scheme: light;
+    --fondo: #f9f9f7; --superficie: #fcfcfb;
+    --tinta: #0b0b0b; --tinta-2: #52514e; --tinta-suave: #898781;
+    --reja: #e1e0d9; --borde: rgba(11,11,11,.10);
+    --serie-1: #2a78d6; --serie-2: #eb6834;
+    --ok: #0ca30c; --atencion: #fab219; --critico: #d03b3b; --sindatos: #898781;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      color-scheme: dark;
+      --fondo: #0d0d0d; --superficie: #1a1a19;
+      --tinta: #f0efec; --tinta-2: #c3c2b7;
+      --reja: #2c2c2a; --borde: rgba(255,255,255,.10);
+      --serie-1: #3987e5; --serie-2: #d95926;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--fondo); color: var(--tinta);
+    font: 15px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  main { max-width: 1060px; margin: 0 auto; padding: 20px 16px 48px; }
+  h1 { font-size: 22px; margin: 4px 0 2px; }
+  h2 { font-size: 15px; color: var(--tinta-2); font-weight: 600; margin: 28px 0 10px; }
+  #sub { color: var(--tinta-suave); font-size: 13px; margin: 0; }
+  .tarjetas { display: grid; gap: 10px; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); }
+  .tarjeta {
+    background: var(--superficie); border: 1px solid var(--borde);
+    border-radius: 10px; padding: 12px 14px;
+  }
+  .tarjeta .regla { font-size: 12px; color: var(--tinta-suave); }
+  .tarjeta .nombre { font-weight: 600; margin: 1px 0 6px; }
+  .nivel { display: inline-flex; align-items: center; gap: 6px; font-size: 12px;
+           font-weight: 700; letter-spacing: .03em; }
+  .nivel::before { content: ""; width: 9px; height: 9px; border-radius: 50%;
+                   background: var(--color-nivel); }
+  .tarjeta .accion { font-size: 13px; color: var(--tinta-2); margin-top: 6px; }
+  .tarjeta .evidencia { font-size: 12px; color: var(--tinta-suave); margin-top: 4px; }
+  .stats { display: grid; gap: 10px; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); }
+  .stat { background: var(--superficie); border: 1px solid var(--borde);
+          border-radius: 10px; padding: 10px 14px; }
+  .stat .v { font-size: 24px; font-weight: 650; }
+  .stat .k { font-size: 12px; color: var(--tinta-suave); }
+  .panel { background: var(--superficie); border: 1px solid var(--borde);
+           border-radius: 10px; padding: 14px; }
+  .grafica { position: relative; height: 260px; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th { text-align: left; color: var(--tinta-suave); font-weight: 600;
+       border-bottom: 1px solid var(--reja); padding: 6px 8px; }
+  td { padding: 6px 8px; border-bottom: 1px solid var(--reja); }
+  td.niv { font-weight: 700; white-space: nowrap; }
+  #mapa { height: 280px; border-radius: 10px; }
+  #error { color: var(--critico); font-size: 13px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Agricultura IoT — decisiones</h1>
+  <p id="sub">Cargando…</p>
+  <p id="error"></p>
+
+  <h2>¿Qué hacer ahora? (reglas R1–R5)</h2>
+  <div class="tarjetas" id="semaforo"></div>
+
+  <h2>Ahora mismo</h2>
+  <div class="stats" id="stats"></div>
+
+  <h2>Temperatura y punto de rocío (24 h)</h2>
+  <div class="panel"><div class="grafica"><canvas id="gTemp"></canvas></div></div>
+
+  <h2>VPD — déficit de presión de vapor (24 h)</h2>
+  <div class="panel"><div class="grafica"><canvas id="gVpd"></canvas></div></div>
+
+  <h2>Historial de decisiones</h2>
+  <div class="panel" style="overflow-x:auto">
+    <table><thead><tr><th>Desde</th><th>Regla</th><th>Nivel</th><th>Acción</th></tr></thead>
+    <tbody id="historial"></tbody></table>
+  </div>
+
+  <h2>Ubicación del sensor</h2>
+  <div class="panel"><div id="mapa">Sin posición GPS todavía.</div></div>
+</main>
+
+<script>
+"use strict";
+const NIVELES = {
+  OK:        { color: "var(--ok)",       icono: "✓", texto: "OK" },
+  ATENCION:  { color: "var(--atencion)", icono: "!", texto: "ATENCIÓN" },
+  CRITICO:   { color: "var(--critico)",  icono: "✕", texto: "CRÍTICO" },
+  SIN_DATOS: { color: "var(--sindatos)", icono: "?", texto: "SIN DATOS" },
+};
+const UNIDADES = {
+  vpd_30min_kpa: " kPa", delta_rocio_c: " °C", t_10min_c: " °C",
+  t_30min_c: " °C", t_pred_1h_c: " °C", tendencia_c_por_h: " °C/h",
+  rssi_avg: " dBm", minutos_sin_datos: " min", horas_hr_alta: " h",
+};
+let graficas = {}, mapa = null;
+
+const fmtHora = iso => new Date(iso).toLocaleTimeString("es-CO",
+                        { hour: "2-digit", minute: "2-digit" });
+const fmtFecha = iso => new Date(iso).toLocaleString("es-CO",
+                        { day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit" });
+const num = (v, d = 1) => v == null ? "—" : Number(v).toFixed(d);
+const css = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+
+async function pedir(ruta) {
+  const r = await fetch(ruta);
+  if (!r.ok) throw new Error(`${ruta} → ${r.status}`);
+  return r.json();
+}
+
+function tarjetaRegla(d) {
+  const n = NIVELES[d.nivel] || NIVELES.SIN_DATOS;
+  const ev = Object.entries(d.evidencia || {})
+    .filter(([, v]) => v != null)
+    .map(([k, v]) => `${k.replace(/_/g, " ")}: ${typeof v === "number" ? +v.toFixed(2) : v}${UNIDADES[k] || ""}`)
+    .join(" · ");
+  return `<div class="tarjeta">
+    <div class="regla">${d.regla} · desde ${fmtFecha(d.desde)}</div>
+    <div class="nombre">${d.nombre}</div>
+    <span class="nivel" style="--color-nivel:${n.color}">${n.icono} ${n.texto}</span>
+    <div class="accion">${d.accion}</div>
+    <div class="evidencia">${ev}</div>
+  </div>`;
+}
+
+function stat(k, v, u = "") {
+  return `<div class="stat"><div class="v">${v}<small>${u}</small></div><div class="k">${k}</div></div>`;
+}
+
+function opcionesBase() {
+  const tinta = css("--tinta-suave"), reja = css("--reja");
+  return {
+    responsive: true, maintainAspectRatio: false, animation: false,
+    interaction: { mode: "index", intersect: false },
+    scales: {
+      x: { grid: { color: reja }, ticks: { color: tinta, maxTicksLimit: 8 } },
+      y: { grid: { color: reja }, ticks: { color: tinta } },
+    },
+    plugins: { legend: { labels: { color: css("--tinta-2"), boxWidth: 14, boxHeight: 3 } } },
+  };
+}
+
+function lineaUmbral(valor, etiqueta) {
+  return { label: etiqueta, data: [], borderColor: css("--tinta-suave"),
+           borderDash: [5, 4], borderWidth: 1, pointRadius: 0, umbral: valor };
+}
+
+// Chart.js no trae lineas de referencia: este mini-plugin dibuja las que
+// cada dataset declare en "umbral", con su etiqueta.
+const plugUmbrales = {
+  id: "umbrales",
+  afterDatasetsDraw(ch) {
+    const { ctx, chartArea: a, scales: { y } } = ch;
+    ctx.save();
+    ctx.font = "11px system-ui"; ctx.fillStyle = css("--tinta-suave");
+    ctx.strokeStyle = css("--tinta-suave"); ctx.setLineDash([5, 4]); ctx.lineWidth = 1;
+    for (const ds of ch.data.datasets) if (ds.umbral != null) {
+      const py = y.getPixelForValue(ds.umbral);
+      if (py < a.top || py > a.bottom) continue;
+      ctx.beginPath(); ctx.moveTo(a.left, py); ctx.lineTo(a.right, py); ctx.stroke();
+      ctx.fillText(ds.label, a.left + 4, py - 4);
+    }
+    ctx.restore();
+  },
+};
+
+function graficar(id, etiquetas, datasets, opciones = {}) {
+  graficas[id]?.destroy();
+  graficas[id] = new Chart(document.getElementById(id), {
+    type: "line",
+    data: { labels: etiquetas, datasets },
+    options: { ...opcionesBase(), ...opciones },
+    plugins: [plugUmbrales],
+  });
+}
+
+async function refrescar() {
+  try {
+    const [decisiones, indicadores, medidas, historial, actual] = await Promise.all([
+      pedir("/api/decisiones"), pedir("/api/indicadores?horas=24"),
+      pedir("/api/medidas?horas=24"), pedir("/api/decisiones/historial?limite=25"),
+      pedir("/api/actual"),
+    ]);
+    document.getElementById("error").textContent = "";
+    document.getElementById("sub").textContent =
+      `${actual.entidad} · actualizado ${new Date().toLocaleTimeString("es-CO")}`;
+
+    const orden = ["R1", "R2", "R3", "R4", "R5"];
+    document.getElementById("semaforo").innerHTML = decisiones
+      .sort((a, b) => orden.indexOf(a.regla) - orden.indexOf(b.regla))
+      .map(tarjetaRegla).join("");
+
+    const ult = indicadores.at(-1) || {};
+    document.getElementById("stats").innerHTML =
+      stat("Temperatura", num(ult.temperatura), " °C") +
+      stat("Humedad", num(ult.humedad, 0), " %") +
+      stat("VPD (30 min)", num(ult.vpd, 2), " kPa") +
+      stat("Punto de rocío", num(ult.punto_rocio), " °C") +
+      stat("T prevista +1 h", num(ult.t_pred_1h), " °C") +
+      stat("Grados-día hoy", num(ult.gdd_hoy), "");
+
+    const linea = (et, datos, color) => ({
+      label: et, data: datos, borderColor: color, backgroundColor: color,
+      borderWidth: 2, pointRadius: 0, pointHoverRadius: 4, spanGaps: true,
+    });
+
+    graficar("gTemp", medidas.map(m => fmtHora(m.momento)), [
+      linea("Temperatura (°C)", medidas.map(m => m.temperatura), css("--serie-1")),
+      linea("Punto de rocío (°C)",
+            indicadoresEnMedidas(indicadores, medidas, "punto_rocio"), css("--serie-2")),
+      lineaUmbral(2, "helada 2 °C"), lineaUmbral(35, "calor 35 °C"),
+    ]);
+
+    graficar("gVpd", indicadores.map(i => fmtHora(i.momento)), [
+      linea("VPD (kPa)", indicadores.map(i => i.vpd), css("--serie-1")),
+      lineaUmbral(0.4, "hongos 0,4"), lineaUmbral(1.2, "atención 1,2"),
+      lineaUmbral(1.6, "crítico 1,6"),
+    ], { plugins: { legend: { display: false } } });
+
+    document.getElementById("historial").innerHTML = historial.map(d => {
+      const n = NIVELES[d.nivel] || NIVELES.SIN_DATOS;
+      return `<tr><td>${fmtFecha(d.desde)}</td><td>${d.regla} ${d.nombre}</td>
+        <td class="niv" style="color:${n.color}">${n.icono} ${n.texto}</td>
+        <td>${d.accion}</td></tr>`;
+    }).join("");
+
+    pintarMapa(actual.posicion);
+  } catch (e) {
+    document.getElementById("error").textContent = `Sin conexión con la API: ${e.message}`;
+  }
+}
+
+// Alinea la serie de indicadores (1 por minuto) con las cubetas de medidas.
+function indicadoresEnMedidas(indicadores, medidas, campo) {
+  return medidas.map(m => {
+    const t = new Date(m.momento).getTime();
+    let mejor = null, dist = 6 * 60000;
+    for (const i of indicadores) {
+      const d = Math.abs(new Date(i.momento).getTime() - t);
+      if (d < dist) { dist = d; mejor = i[campo]; }
+    }
+    return mejor;
+  });
+}
+
+function pintarMapa(p) {
+  if (!p || p.latitud == null) return;
+  const pos = [p.latitud, p.longitud];
+  if (!mapa) {
+    document.getElementById("mapa").textContent = "";
+    mapa = L.map("mapa").setView(pos, 16);
+    L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png",
+                { attribution: "© OpenStreetMap" }).addTo(mapa);
+    mapa.marcador = L.marker(pos).addTo(mapa);
+  }
+  mapa.marcador.setLatLng(pos)
+      .bindPopup(`Última posición: ${fmtFecha(p.time_index)}`);
+}
+
+refrescar();
+setInterval(refrescar, 60000);
+matchMedia("(prefers-color-scheme: dark)").addEventListener("change", refrescar);
+</script>
+</body>
+</html>

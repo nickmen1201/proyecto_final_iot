@@ -1,0 +1,13 @@
+# Front en 80/443. DOMINIO viene del .env del compose:
+#   - en la EC2: 34-237-180-187.sslip.io -> Caddy saca solo el certificado
+#     de Let's Encrypt (sslip.io resuelve ese nombre a la IP de la EC2)
+#   - sin definir: localhost con certificado interno, para probar en el PC
+{$DOMINIO:localhost} {
+	handle /api/* {
+		reverse_proxy api:8000
+	}
+	handle {
+		root * /srv
+		file_server
+	}
+}
