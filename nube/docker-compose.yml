@@ -2,11 +2,22 @@
 # Reconstruido a partir de "docker compose config" de la EC2 (2026-10-21):
 # mismos servicios, imagenes, variables, puertos y volumenes.
 # Ver nube/README.md.
+#
+# Versiones actualizadas el 2026-11-11 (mongo 6.0 y crate 4.8 ya no tienen
+# soporte). Combinacion probada de punta a punta en local: aprovisionamiento,
+# POST al agente, entidad en Orion, notificacion y fila en CrateDB.
+#   orion 4.1.0 -> 4.5.0   (ultima imagen publicada)
+#   mongo 6.0   -> 8.0     (version de referencia de Orion desde la 4.2.0)
+#   crate 4.8.1 -> 6.5.1
+#   iotagent-json 3.14.0 y quantumleap 1.0.0 ya son las ultimas.
+# Mongo 8 no abre datos de 6.0 y CrateDB 6 no lee tablas creadas en 4.x: al
+# migrar se borran los volumenes (docker compose down -v) y se vuelve a
+# correr provisionamiento.sh. El historico anterior no se conserva.
 
 services:
   # Estado actual de las entidades (NGSI-v2).
   orion:
-    image: quay.io/fiware/orion:4.1.0
+    image: quay.io/fiware/orion:4.5.0
     restart: unless-stopped
     depends_on:
       - mongo-db
@@ -16,7 +27,7 @@ services:
 
   # Base de datos de Orion y del IoT Agent. Sin puerto publicado.
   mongo-db:
-    image: mongo:6.0
+    image: mongo:8.0
     restart: unless-stopped
     volumes:
       - mongo-db:/data/db
@@ -58,7 +69,7 @@ services:
 
   # Base de datos del historico. 4200: API SQL y consola web.
   crate-db:
-    image: crate:4.8.1
+    image: crate:6.5.1
     restart: unless-stopped
     ports:
       - "4200:4200"

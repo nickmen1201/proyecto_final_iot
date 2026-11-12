@@ -8,6 +8,11 @@ Lo que se describe aquí se verificó contra la EC2 el 2026-10-21 con
 [`recolectar_info.sh`](recolectar_info.sh). Lo que todavía falta confirmar está
 marcado con ⏳ **PENDIENTE**.
 
+> ⏳ **PENDIENTE:** el 2026-11-11 se actualizaron las imágenes a versiones con
+> soporte (Orion 4.5.0, MongoDB 8.0, CrateDB 6.5.1; ver el encabezado de
+> [`docker-compose.yml`](docker-compose.yml)). La combinación se probó en local
+> de punta a punta, pero falta aplicarla en la EC2.
+
 | Archivo | Para qué sirve |
 |---|---|
 | `README.md` | Esta documentación |
@@ -29,10 +34,10 @@ flowchart LR
     end
     subgraph EC2["AWS EC2 34.237.180.187 - docker compose"]
         IOTA["IoT Agent JSON<br/>3.14.0"]
-        ORION["Orion Context Broker<br/>4.1.0"]
-        MONGO[("MongoDB<br/>6.0")]
+        ORION["Orion Context Broker<br/>4.5.0"]
+        MONGO[("MongoDB<br/>8.0")]
         QL["QuantumLeap<br/>1.0.0"]
-        CRATE[("CrateDB<br/>4.8.1")]
+        CRATE[("CrateDB<br/>6.5.1")]
     end
     E -- "LoRa 915 MHz<br/>JSON" --> G
     G -- "HTTP POST :5555<br/>JSON" --> IOTA
@@ -50,10 +55,10 @@ flowchart LR
 | Emisor | firmware propio ([src/emisor](../src/emisor/main.cpp)) | Mide temperatura, humedad y posición GPS cada 10 s y lo transmite por LoRa | — |
 | Gateway | firmware propio ([src/gateway](../src/gateway/main.cpp)) | Recibe por LoRa y reenvía por HTTP a la nube, con cola de reintentos | — |
 | IoT Agent JSON | `quay.io/fiware/iotagent-json:3.14.0-distroless` (usa iotagent-node-lib 4.14.0) | Traduce el JSON del dispositivo a entidades NGSI-v2 de Orion | [IoT Agent JSON](https://fiware-iotagent-json.readthedocs.io/) · [iotagent-node-lib](https://iotagent-node-lib.readthedocs.io/) |
-| Orion Context Broker | `quay.io/fiware/orion:4.1.0` | Guarda el **estado actual** de cada entidad y avisa a los suscriptores cuando cambia | [Orion 4.1.0](https://fiware-orion.rtfd.io/en/4.1.0/) · [especificación NGSI-v2](https://fiware.github.io/specifications/ngsiv2/stable/) |
-| MongoDB | `mongo:6.0` | Base de datos de Orion y del IoT Agent | [MongoDB 6.0](https://www.mongodb.com/docs/v6.0/) |
+| Orion Context Broker | `quay.io/fiware/orion:4.5.0` | Guarda el **estado actual** de cada entidad y avisa a los suscriptores cuando cambia | [Orion 4.5.0](https://fiware-orion.readthedocs.io/en/4.5.0/) · [especificación NGSI-v2](https://fiware.github.io/specifications/ngsiv2/stable/) |
+| MongoDB | `mongo:8.0` | Base de datos de Orion y del IoT Agent | [MongoDB 8.0](https://www.mongodb.com/docs/v8.0/) |
 | QuantumLeap | `orchestracities/quantumleap:1.0.0` | Recibe las notificaciones de Orion y guarda cada cambio como una serie de tiempo | [QuantumLeap](https://quantumleap.readthedocs.io/) |
-| CrateDB | `crate:4.8.1` | Base de datos SQL donde QuantumLeap guarda el **histórico** | [CrateDB 4.8](https://cratedb.com/docs/crate/reference/en/4.8/) |
+| CrateDB | `crate:6.5.1` | Base de datos SQL donde QuantumLeap guarda el **histórico** | [CrateDB](https://cratedb.com/docs/crate/reference/en/latest/) |
 
 ### Infraestructura
 
@@ -249,6 +254,44 @@ Para repetir la consulta en la EC2:
 cd ~/fiware
 docker compose logs --no-color orion | grep "Request received" | grep -v " GET " | tail -5
 ```
+
+#### ¿Está deprecado ese método?
+
+En la revisión anterior se observó que "crear el atributo si no existe y
+actualizarlo si existe" pertenece a una versión deprecada. Hay dos operaciones
+**con esa misma semántica** que sí están deprecadas, y ninguna es la que se
+usa aquí:
+
+| Operación | Estado según Orion | ¿La usa el proyecto? |
+|---|---|---|
+| NGSIv1 `POST /v1/updateContext` con `updateAction: APPEND` | Deprecada en Orion 2.0.0. Las últimas operaciones NGSIv1 se **eliminaron en Orion 4.0.0**. | **No.** Con Orion 4.x ni siquiera existe. |
+| NGSI-v2 `POST /v2/op/update` con `actionType` en mayúsculas (`APPEND`, `UPDATE`…) | Deprecada desde Orion 1.14.0. El reemplazo es en minúsculas (`append`, `update`…). | **No.** |
+| NGSI-v2 `POST /v2/entities?options=upsert` | No aparece en la lista de deprecaciones | **Sí.** Es la que envía el IoT Agent. |
+
+Fuente: la [lista oficial de funcionalidades deprecadas de Orion](https://github.com/telefonicaid/fiware-orion/blob/master/doc/manuals/deprecated.md).
+
+La petición tampoco la escribe el proyecto. La arma la librería del agente
+(`iotagent-node-lib`, en `lib/services/ngsi/entities-NGSI-v2.js`): para una sola
+entidad usa `POST /v2/entities?options=upsert`, y para varias usa
+`POST /v2/op/update` con `actionType: 'append'` en minúsculas. Ninguna de las
+dos está deprecada.
+
+**Comprobación con la última versión de Orion (4.5.0)**, hecha en local el
+2026-11-11 con el compose de esta carpeta:
+
+```
+msg=Request received: POST /v2/entities?options=upsert   response code: 204
+msg=Request received: POST /v2/entities?options=upsert   response code: 204
+dateCreated  2026-11-12T03:10:54.587Z   (no cambia entre medidas)
+dateModified 2026-11-12T03:10:54.704Z   (avanza con cada medida)
+```
+
+**Alternativa evaluada y descartada: pasar a NGSI-LD** (Orion-LD). No elimina
+el *upsert*. Con NGSI-LD el agente envía
+`POST /ngsi-ld/v1/entityOperations/upsert?options=update`, y la propia
+documentación del agente marca el modo NGSI-LD como *experimental*. Además,
+QuantumLeap y la suscripción tendrían que rehacerse. NGSI-v2 sigue siendo la
+API estable de Orion.
 
 #### d) Orion → QuantumLeap → CrateDB: el histórico
 

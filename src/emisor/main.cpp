@@ -300,14 +300,14 @@ static void estadoGps()
     if (dato_gps_valido) {
         dato_latitud  = gps.location.lat();
         dato_longitud = gps.location.lng();
-        Serial.printf("---- GPS: lat=%.6f lon=%.6f (%u satelites)\n",
-                      dato_latitud, dato_longitud, gps.satellites.value());
+        Serial.printf("---- GPS: lat=%.6f lon=%.6f (%lu satelites)\n",
+                      dato_latitud, dato_longitud, (unsigned long)gps.satellites.value());
     } else if (gps.location.isValid()) {
-        Serial.printf("---- GPS: fix perdido hace %lu ms (%u satelites), se enviara null\n",
-                      (unsigned long)gps.location.age(), gps.satellites.value());
+        Serial.printf("---- GPS: fix perdido hace %lu ms (%lu satelites), se enviara null\n",
+                      (unsigned long)gps.location.age(), (unsigned long)gps.satellites.value());
     } else {
-        Serial.printf("---- GPS: sin fix todavia (%u satelites), se enviara null\n",
-                      gps.satellites.value());
+        Serial.printf("---- GPS: sin fix todavia (%lu satelites), se enviara null\n",
+                      (unsigned long)gps.satellites.value());
     }
 
     // "Sin fix" puede ser falta de cielo o que el modulo no este mandando
