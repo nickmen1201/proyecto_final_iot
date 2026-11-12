@@ -10,6 +10,11 @@ import time
 import comun
 
 PERIODO_S = int(os.getenv("PERIODO_S", "60"))
+LOTE = 5000
+# No se leen los ultimos segundos: CrateDB hace visibles las filas con hasta
+# 1 s de retraso, y una fila que apareciera DESPUES de avanzar la marca de
+# agua se perderia para siempre.
+MARGEN_MS = 5000
 
 INSERTAR = """
     INSERT INTO medidas_limpias
@@ -22,15 +27,25 @@ INSERTAR = """
 """
 
 
+def semilla_saltos(pg):
+    """Ultima temperatura aceptada de cada equipo, para el control de saltos."""
+    with pg.cursor() as cur:
+        cur.execute("""SELECT DISTINCT ON (entity_id) entity_id, temperatura,
+                              (extract(epoch FROM time_index) * 1000)::bigint
+                       FROM medidas_limpias WHERE temperatura IS NOT NULL
+                       ORDER BY entity_id, time_index DESC""")
+        return {eid: (t, ts) for eid, t, ts in cur.fetchall()}
+
+
 def ciclo(pg, ultima_t):
     with pg.cursor() as cur:
         cur.execute("SELECT ultimo_ts FROM marca_agua WHERE servicio = 'limpiar'")
         fila = cur.fetchone()
         desde_ms = int(fila[0].timestamp() * 1000) if fila else 0
 
-    crudas = comun.leer_crudas(desde_ms)
+    crudas = comun.leer_crudas(desde_ms, time.time() * 1000 - MARGEN_MS, LOTE)
     if not crudas:
-        return 0
+        return
 
     limpias = [x for m in crudas if (x := comun.limpiar_medida(m, ultima_t))]
     with pg.cursor() as cur:
@@ -41,25 +56,21 @@ def ciclo(pg, ultima_t):
             (crudas[-1]["time_index"],),
         )
     print(f"limpiar: {len(crudas)} crudas -> {len(limpias)} limpias", flush=True)
-    return len(crudas)
 
 
 def main():
-    pg = comun.pg_conn()
-    # Semilla del control de saltos: la ultima T aceptada de cada equipo.
-    with pg.cursor() as cur:
-        cur.execute("""SELECT DISTINCT ON (entity_id) entity_id, temperatura,
-                              (extract(epoch FROM time_index) * 1000)::bigint
-                       FROM medidas_limpias WHERE temperatura IS NOT NULL
-                       ORDER BY entity_id, time_index DESC""")
-        ultima_t = {eid: (t, ts) for eid, t, ts in cur.fetchall()}
-
+    ultima_t = None
     while True:
+        # Conexion nueva en cada pasada: si Postgres se reinicia, el servicio
+        # se recupera solo en el siguiente ciclo.
         try:
-            ciclo(pg, ultima_t)
+            with comun.pg_conn() as pg:
+                if ultima_t is None:
+                    ultima_t = semilla_saltos(pg)
+                ciclo(pg, ultima_t)
         except Exception as e:
-            # Lo normal al principio: la tabla de CrateDB aun no existe
-            # porque no ha llegado la primera medida.
+            # Lo normal al principio: Postgres aun arrancando, o la tabla de
+            # CrateDB no existe porque no ha llegado la primera medida.
             print(f"limpiar: {e}", flush=True)
         time.sleep(PERIODO_S)
 

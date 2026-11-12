@@ -13,7 +13,7 @@ import json
 import math
 import os
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
 import comun
@@ -33,6 +33,7 @@ UMBRALES = {
     "vpd_hongos": 0.4,      # kPa: aire casi saturado
     "vpd_margen": 0.1,
     "rocio_delta": 2.0,     # C entre T y punto de rocio: condensacion
+    "rocio_margen": 0.5,
     "hr_hongos": 90.0,      # % de HR sostenida
     "horas_hongos": 3,      # horas con HR alta (de las ultimas 6) para alertar
     "helada_t": 2.0,        # C
@@ -123,7 +124,7 @@ def resumen_por_hora(filas):
 # Capa predictiva: indicadores del momento
 # ---------------------------------------------------------------------------
 def calcular_indicadores(filas, ahora_ms):
-    """filas limpias de UNA entidad (48 h) -> dict de indicadores."""
+    """filas limpias de UNA entidad (48 h, puede ser vacia) -> indicadores."""
     def ventana(minutos):
         corte = ahora_ms - minutos * 60000
         return [f for f in filas
@@ -151,8 +152,11 @@ def calcular_indicadores(filas, ahora_ms):
     total = len(hora) + perdidas
 
     return {
-        "temperatura": t_act,
+        # minutos desde la ultima trama recibida (aunque el sensor fallara)
+        "edad_min": (ahora_ms - filas[-1]["time_index"]) / 60000.0 if filas else None,
+        "temperatura": t_act,                               # promedio de 10 min
         "humedad": h_act,
+        "t_30min": promedio([f["temperatura"] for f in v30]),
         "vpd": promedio([vpd(f["temperatura"], f["humedad"])
                          for f in v30 if f["humedad"] is not None]),
         "punto_rocio": rocio,
@@ -182,87 +186,90 @@ def clasificar(valor, atencion, critico, previo, margen):
     return "OK"
 
 
-def evaluar_reglas(ind, resumen, previos, u=UMBRALES):
+def evaluar_reglas(ind, resumen, previos, ahora_ms, u=UMBRALES):
     """-> lista de (regla, nombre, nivel, accion, evidencia)."""
-    reglas = []
-
     # R5 primero: si no hay datos frescos, las demas reglas no pueden decir
     # "todo bien": dicen SIN_DATOS.
     edad_min = ind["edad_min"]
-    sin_datos = edad_min is None or edad_min > SIN_DATOS_MIN
-    if sin_datos:
-        r5 = ("CRITICO", "Revisar el emisor o el gateway: no llegan medidas.",
-              {"minutos_sin_datos": None if edad_min is None else round(edad_min, 1)})
-    elif (ind["perdida_pct"] or 0) > u["perdida_max"] or \
-         (ind["rssi_avg"] is not None and ind["rssi_avg"] < u["rssi_min"]):
-        r5 = ("ATENCION", "Revisar la antena o la ubicacion del gateway: el enlace pierde tramas.",
-              {"perdida_pct": ind["perdida_pct"], "rssi_avg": ind["rssi_avg"]})
-    else:
-        r5 = ("OK", "Enlace y equipos funcionando.",
-              {"perdida_pct": ind["perdida_pct"], "rssi_avg": ind["rssi_avg"]})
-
-    if sin_datos:
-        accion = "Sin datos recientes: no se puede evaluar."
-        for regla, nombre in [("R1", "Estres hidrico"), ("R2", "Riesgo de hongos"),
-                              ("R3", "Helada"), ("R4", "Estres termico")]:
-            reglas.append((regla, nombre, "SIN_DATOS", accion,
-                           {"minutos_sin_datos": None if edad_min is None else round(edad_min, 1)}))
-        reglas.append(("R5", "Salud del sistema") + r5)
+    if edad_min is None or edad_min > SIN_DATOS_MIN:
+        ev = {"minutos_sin_datos": None if edad_min is None else round(edad_min, 1)}
+        reglas = [(r, nombre, "SIN_DATOS", "Sin datos recientes: no se puede evaluar.", ev)
+                  for r, nombre in [("R1", "Estrés hídrico"), ("R2", "Riesgo de hongos"),
+                                    ("R3", "Helada"), ("R4", "Estrés térmico")]]
+        reglas.append(("R5", "Salud del sistema", "CRITICO",
+                       "Revisar el emisor o el gateway: no llegan medidas.", ev))
         return reglas
+
+    reglas = []
+    sin_aire = "Sin lecturas de aire válidas."
 
     # R1: estres hidrico por VPD alto (promedio de 30 min)
     nivel = clasificar(ind["vpd"], u["vpd_atencion"], u["vpd_critico"],
                        previos.get("R1"), u["vpd_margen"])
     accion = {"CRITICO": "Regar ahora; sombrear si persiste.",
-              "ATENCION": "Programar riego en las proximas horas.",
-              "OK": "Demanda hidrica normal.",
-              "SIN_DATOS": "Sin lecturas de aire validas."}[nivel]
-    reglas.append(("R1", "Estres hidrico", nivel, accion,
+              "ATENCION": "Programar riego en las próximas horas.",
+              "OK": "Demanda hídrica normal.",
+              "SIN_DATOS": sin_aire}[nivel]
+    reglas.append(("R1", "Estrés hídrico", nivel, accion,
                    {"vpd_30min_kpa": ind["vpd"]}))
 
     # R2: hongos por condensacion (T-Td), HR alta sostenida o VPD muy bajo
-    horas_hr_alta = sum(1 for r in resumen[-6:]
-                        if r["h_avg"] is not None and r["h_avg"] >= u["hr_hongos"])
+    horas_hr_alta = sum(1 for r in resumen
+                        if r["hora"] > ahora_ms - 6 * 3600000
+                        and r["h_avg"] is not None and r["h_avg"] >= u["hr_hongos"])
+    delta_lim = u["rocio_delta"] + (u["rocio_margen"]
+                                    if previos.get("R2") == "CRITICO" else 0)
     if ind["delta_rocio"] is None:
-        nivel, accion = "SIN_DATOS", "Sin lecturas de aire validas."
-    elif ind["delta_rocio"] <= u["rocio_delta"] or horas_hr_alta >= u["horas_hongos"]:
+        nivel, accion = "SIN_DATOS", sin_aire
+    elif ind["delta_rocio"] <= delta_lim or horas_hr_alta >= u["horas_hongos"]:
         nivel = "CRITICO"
-        accion = "Ventilar y suspender el riego por aspersion; considerar fungicida preventivo."
+        accion = "Ventilar y suspender el riego por aspersión; considerar fungicida preventivo."
     elif ind["vpd"] is not None and ind["vpd"] < u["vpd_hongos"]:
         nivel, accion = "ATENCION", "Ventilar; no regar por ahora."
     else:
-        nivel, accion = "OK", "Sin condiciones de condensacion."
+        nivel, accion = "OK", "Sin condiciones de condensación."
     reglas.append(("R2", "Riesgo de hongos", nivel, accion,
                    {"delta_rocio_c": ind["delta_rocio"], "horas_hr_alta": horas_hr_alta,
                     "vpd_30min_kpa": ind["vpd"]}))
 
-    # R3: helada actual o prevista (menor = peor: se clasifica con el signo
-    # invertido)
-    nivel = clasificar(-ind["temperatura"] if ind["temperatura"] is not None else None,
-                       atencion=999.0,                  # ATENCION solo via prediccion
-                       critico=-u["helada_t"],
-                       previo=previos.get("R3"), margen=u["helada_margen"])
-    if nivel == "OK" and ind["t_pred_1h"] is not None and ind["t_pred_1h"] <= u["helada_t"]:
-        nivel = "ATENCION"
-    accion = {"CRITICO": "Activar proteccion antiheladas (cubrir o riego).",
-              "ATENCION": "Preparar proteccion: helada probable en ~1 hora.",
-              "OK": "Sin riesgo de helada.",
-              "SIN_DATOS": "Sin lecturas de aire validas."}[nivel]
+    # R3: helada actual (CRITICO) o prevista para dentro de 1 hora (ATENCION)
+    t, pred = ind["temperatura"], ind["t_pred_1h"]
+    helada_lim = u["helada_t"] + (u["helada_margen"]
+                                  if previos.get("R3") == "CRITICO" else 0)
+    if t is None:
+        nivel, accion = "SIN_DATOS", sin_aire
+    elif t <= helada_lim:
+        nivel, accion = "CRITICO", "Activar protección antiheladas (cubrir o riego)."
+    elif pred is not None and pred <= u["helada_t"]:
+        nivel, accion = "ATENCION", "Preparar protección: helada probable en ~1 hora."
+    else:
+        nivel, accion = "OK", "Sin riesgo de helada."
     reglas.append(("R3", "Helada", nivel, accion,
-                   {"t_10min_c": ind["temperatura"], "t_pred_1h_c": ind["t_pred_1h"],
+                   {"t_10min_c": t, "t_pred_1h_c": pred,
                     "tendencia_c_por_h": ind["tendencia_t"]}))
 
     # R4: estres termico por calor (promedio de 30 min)
-    v30 = ind.get("t_30min")
-    nivel = clasificar(v30, u["calor_atencion"], u["calor_critico"],
+    nivel = clasificar(ind["t_30min"], u["calor_atencion"], u["calor_critico"],
                        previos.get("R4"), u["calor_margen"])
     accion = {"CRITICO": "Sombrear o nebulizar; reforzar el riego.",
               "ATENCION": "Vigilar; preparar sombreo.",
               "OK": "Temperatura en zona segura.",
-              "SIN_DATOS": "Sin lecturas de aire validas."}[nivel]
-    reglas.append(("R4", "Estres termico", nivel, accion, {"t_30min_c": v30}))
+              "SIN_DATOS": sin_aire}[nivel]
+    reglas.append(("R4", "Estrés térmico", nivel, accion,
+                   {"t_30min_c": ind["t_30min"]}))
 
-    reglas.append(("R5", "Salud del sistema") + r5)
+    # R5: llegan tramas; falta ver si el sensor mide y si el enlace aguanta
+    ev = {"perdida_pct": ind["perdida_pct"], "rssi_avg": ind["rssi_avg"]}
+    if t is None:
+        nivel = "ATENCION"
+        accion = "Revisar el sensor de aire del emisor: llegan tramas pero sin lecturas válidas."
+    elif ((ind["perdida_pct"] or 0) > u["perdida_max"]
+          or (ind["rssi_avg"] is not None and ind["rssi_avg"] < u["rssi_min"])):
+        nivel = "ATENCION"
+        accion = "Revisar la antena o la ubicación del gateway: el enlace pierde tramas."
+    else:
+        nivel, accion = "OK", "Enlace y equipos funcionando."
+    reglas.append(("R5", "Salud del sistema", nivel, accion, ev))
     return reglas
 
 
@@ -319,7 +326,10 @@ def guardar_decisiones(cur, eid, reglas, ahora):
 def ciclo(pg):
     ahora = datetime.now(timezone.utc)
     ahora_ms = int(ahora.timestamp() * 1000)
-    crudas = comun.leer_crudas(ahora_ms - VENTANA_H * 3600000, limite=50000)
+    # recientes=True: si la ventana no cupiera en el limite, se conservan las
+    # filas nuevas (perder las ultimas pareceria un "sin datos" falso).
+    crudas = comun.leer_crudas(ahora_ms - VENTANA_H * 3600000, ahora_ms,
+                               limite=100000, recientes=True)
 
     ultima_t, por_entidad = {}, {}
     for m in crudas:
@@ -328,28 +338,35 @@ def ciclo(pg):
             por_entidad.setdefault(f["entity_id"], []).append(f)
 
     with pg.cursor() as cur:
+        # Un equipo que ya tuvo decisiones y desaparecio de la ventana se sigue
+        # evaluando (sin filas -> SIN_DATOS): si no, su ultimo "OK" quedaria
+        # congelado para siempre.
+        cur.execute("SELECT DISTINCT entity_id FROM decisiones")
+        for (eid,) in cur.fetchall():
+            por_entidad.setdefault(eid, [])
+
         for eid, filas in por_entidad.items():
             resumen = resumen_por_hora(filas)
             ind = calcular_indicadores(filas, ahora_ms)
-            ind["edad_min"] = (ahora_ms - filas[-1]["time_index"]) / 60000.0
-            ind["t_30min"] = promedio(
-                [f["temperatura"] for f in filas
-                 if f["time_index"] > ahora_ms - 30 * 60000])
 
             cur.execute("""SELECT DISTINCT ON (regla) regla, nivel FROM decisiones
                            WHERE entity_id = %s ORDER BY regla, desde DESC""", (eid,))
             previos = dict(cur.fetchall())
 
             guardar_resumen(cur, eid, resumen)
-            guardar_indicadores(cur, eid, ind, ahora)
-            guardar_decisiones(cur, eid, evaluar_reglas(ind, resumen, previos), ahora)
+            if filas:
+                guardar_indicadores(cur, eid, ind, ahora)
+            guardar_decisiones(cur, eid,
+                               evaluar_reglas(ind, resumen, previos, ahora_ms), ahora)
 
 
 def main():
-    pg = comun.pg_conn()
     while True:
+        # Conexion nueva en cada pasada: si Postgres se reinicia, el servicio
+        # se recupera solo en el siguiente ciclo.
         try:
-            ciclo(pg)
+            with comun.pg_conn() as pg:
+                ciclo(pg)
         except Exception as e:
             print(f"analitica: {e}", flush=True)
         time.sleep(PERIODO_S)

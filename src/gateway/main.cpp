@@ -9,9 +9,9 @@
 // El IoT Agent JSON de FIWARE espera el id del dispositivo en la URL, no en el
 // cuerpo:
 //
-//   LoRa:  {"id":"461879","n":12,"t":22.41,"h":61.30,"lat":...,"lon":...}
+//   LoRa:  {"id":"461879","n":12,"t":22.41,"h":61.30,"lat":...,"lon":...,"v":3}
 //   HTTP:  POST /iot/json?k=<apikey>&i=461879
-//          {"n":12,"t":22.41,"h":61.30,"lat":...,"lon":...,"rssi":-87,"snr":9.5}
+//          {"n":12,"t":22.41,"h":61.30,"lat":...,"lon":...,"v":3,"rssi":-87,"snr":9.5}
 //
 // Ademas "id" es un nombre reservado en NGSI: si viajara en el cuerpo, Orion
 // rechazaria la actualizacion entera.

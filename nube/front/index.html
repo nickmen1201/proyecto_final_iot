@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Agricultura IoT</title>
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
-<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.4/chart.umd.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.5.1/chart.umd.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
 <style>
   :root {
@@ -33,7 +33,11 @@
   main { max-width: 1060px; margin: 0 auto; padding: 20px 16px 48px; }
   h1 { font-size: 22px; margin: 4px 0 2px; }
   h2 { font-size: 15px; color: var(--tinta-2); font-weight: 600; margin: 28px 0 10px; }
-  #sub { color: var(--tinta-suave); font-size: 13px; margin: 0; }
+  #sub { color: var(--tinta-suave); font-size: 13px; margin: 0;
+         display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+  select { font: inherit; color: var(--tinta); background: var(--superficie);
+           border: 1px solid var(--borde); border-radius: 6px; padding: 3px 6px; }
+  .vacio { color: var(--tinta-suave); font-size: 13px; }
   .tarjetas { display: grid; gap: 10px; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); }
   .tarjeta {
     background: var(--superficie); border: 1px solid var(--borde);
@@ -67,7 +71,10 @@
 <body>
 <main>
   <h1>Agricultura IoT — decisiones</h1>
-  <p id="sub">Cargando…</p>
+  <p id="sub">
+    <label>Equipo <select id="equipo"></select></label>
+    <span id="estado">Cargando…</span>
+  </p>
   <p id="error"></p>
 
   <h2>¿Qué hacer ahora? (reglas R1–R5)</h2>
@@ -100,10 +107,18 @@ const NIVELES = {
   CRITICO:   { color: "var(--critico)",  icono: "✕", texto: "CRÍTICO" },
   SIN_DATOS: { color: "var(--sindatos)", icono: "?", texto: "SIN DATOS" },
 };
-const UNIDADES = {
-  vpd_30min_kpa: " kPa", delta_rocio_c: " °C", t_10min_c: " °C",
-  t_30min_c: " °C", t_pred_1h_c: " °C", tendencia_c_por_h: " °C/h",
-  rssi_avg: " dBm", minutos_sin_datos: " min", horas_hr_alta: " h",
+// Como se muestra cada dato de la evidencia: [etiqueta, unidad, factor]
+const EVIDENCIA = {
+  vpd_30min_kpa:     ["VPD 30 min", " kPa"],
+  delta_rocio_c:     ["T − rocío", " °C"],
+  horas_hr_alta:     ["horas con HR ≥ 90 %", ""],
+  t_10min_c:         ["T 10 min", " °C"],
+  t_30min_c:         ["T 30 min", " °C"],
+  t_pred_1h_c:       ["T prevista +1 h", " °C"],
+  tendencia_c_por_h: ["tendencia", " °C/h"],
+  rssi_avg:          ["RSSI", " dBm"],
+  perdida_pct:       ["tramas perdidas", " %", 100],
+  minutos_sin_datos: ["sin datos hace", " min"],
 };
 let graficas = {}, mapa = null;
 
@@ -124,7 +139,10 @@ function tarjetaRegla(d) {
   const n = NIVELES[d.nivel] || NIVELES.SIN_DATOS;
   const ev = Object.entries(d.evidencia || {})
     .filter(([, v]) => v != null)
-    .map(([k, v]) => `${k.replace(/_/g, " ")}: ${typeof v === "number" ? +v.toFixed(2) : v}${UNIDADES[k] || ""}`)
+    .map(([k, v]) => {
+      const [etiqueta, unidad, factor = 1] = EVIDENCIA[k] || [k, ""];
+      return `${etiqueta}: ${+(v * factor).toFixed(2)}${unidad}`;
+    })
     .join(" · ");
   return `<div class="tarjeta">
     <div class="regla">${d.regla} · desde ${fmtFecha(d.desde)}</div>
@@ -148,7 +166,11 @@ function opcionesBase() {
       x: { grid: { color: reja }, ticks: { color: tinta, maxTicksLimit: 8 } },
       y: { grid: { color: reja }, ticks: { color: tinta } },
     },
-    plugins: { legend: { labels: { color: css("--tinta-2"), boxWidth: 14, boxHeight: 3 } } },
+    plugins: { legend: { labels: {
+      color: css("--tinta-2"), boxWidth: 14, boxHeight: 3,
+      // los umbrales ya llevan su etiqueta sobre la linea
+      filter: (item, datos) => datos.datasets[item.datasetIndex].umbral == null,
+    } } },
   };
 }
 
@@ -176,31 +198,55 @@ const plugUmbrales = {
   },
 };
 
-function graficar(id, etiquetas, datasets, opciones = {}) {
+function graficar(id, etiquetas, datasets, ajustar = () => {}) {
+  const opciones = opcionesBase();
+  ajustar(opciones);
   graficas[id]?.destroy();
   graficas[id] = new Chart(document.getElementById(id), {
     type: "line",
     data: { labels: etiquetas, datasets },
-    options: { ...opcionesBase(), ...opciones },
+    options: opciones,
     plugins: [plugUmbrales],
   });
 }
 
+// El selector se llena con los dispositivos registrados en el IoT Agent.
+// ?entidad=... en la URL de la pagina fija el equipo inicial.
+async function cargarEquipos() {
+  const sel = document.getElementById("equipo");
+  for (const d of await pedir("/api/dispositivos")) {
+    sel.add(new Option(d.id, d.entidad));
+  }
+  const pedida = new URLSearchParams(location.search).get("entidad");
+  if (pedida) sel.value = pedida;
+  sel.addEventListener("change", refrescar);
+}
+
 async function refrescar() {
   try {
+    // sin lista de equipos, la API usa el del dato mas reciente
+    const equipo = document.getElementById("equipo").value;
+    const e = equipo ? "entidad=" + encodeURIComponent(equipo) : "";
     const [decisiones, indicadores, medidas, historial, actual] = await Promise.all([
-      pedir("/api/decisiones"), pedir("/api/indicadores?horas=24"),
-      pedir("/api/medidas?horas=24"), pedir("/api/decisiones/historial?limite=25"),
-      pedir("/api/actual"),
+      pedir(`/api/decisiones?${e}`), pedir(`/api/indicadores?horas=24&${e}`),
+      pedir(`/api/medidas?horas=24&${e}`),
+      pedir(`/api/decisiones/historial?limite=25&${e}`), pedir(`/api/actual?${e}`),
     ]);
-    document.getElementById("error").textContent = "";
-    document.getElementById("sub").textContent =
-      `${actual.entidad} · actualizado ${new Date().toLocaleTimeString("es-CO")}`;
+    document.getElementById("estado").textContent =
+      `actualizado ${new Date().toLocaleTimeString("es-CO")}`;
+
+    // Si Analitica se detiene, el semaforo quedaria congelado: se avisa.
+    const ultima = Math.max(...decisiones.map(d => new Date(d.ultima_evaluacion)));
+    document.getElementById("error").textContent =
+      decisiones.length && Date.now() - ultima > 5 * 60000
+        ? `Atención: las decisiones no se evalúan desde ${fmtFecha(ultima)}. Revisar el servicio de analítica.`
+        : "";
 
     const orden = ["R1", "R2", "R3", "R4", "R5"];
     document.getElementById("semaforo").innerHTML = decisiones
       .sort((a, b) => orden.indexOf(a.regla) - orden.indexOf(b.regla))
-      .map(tarjetaRegla).join("");
+      .map(tarjetaRegla).join("")
+      || `<p class="vacio">Este equipo todavía no ha enviado medidas.</p>`;
 
     const ult = indicadores.at(-1) || {};
     document.getElementById("stats").innerHTML =
@@ -227,7 +273,11 @@ async function refrescar() {
       linea("VPD (kPa)", indicadores.map(i => i.vpd), css("--serie-1")),
       lineaUmbral(0.4, "hongos 0,4"), lineaUmbral(1.2, "atención 1,2"),
       lineaUmbral(1.6, "crítico 1,6"),
-    ], { plugins: { legend: { display: false } } });
+    ], o => {
+      o.plugins.legend.display = false;       // una sola serie: la nombra el titulo
+      o.scales.y.suggestedMin = 0;            // que los tres umbrales se vean siempre
+      o.scales.y.suggestedMax = 1.8;
+    });
 
     document.getElementById("historial").innerHTML = historial.map(d => {
       const n = NIVELES[d.nivel] || NIVELES.SIN_DATOS;
@@ -256,7 +306,7 @@ function indicadoresEnMedidas(indicadores, medidas, campo) {
 }
 
 function pintarMapa(p) {
-  if (!p || p.latitud == null) return;
+  if (!p) return;
   const pos = [p.latitud, p.longitud];
   if (!mapa) {
     document.getElementById("mapa").textContent = "";
@@ -265,11 +315,15 @@ function pintarMapa(p) {
                 { attribution: "© OpenStreetMap" }).addTo(mapa);
     mapa.marcador = L.marker(pos).addTo(mapa);
   }
+  mapa.setView(pos);
   mapa.marcador.setLatLng(pos)
       .bindPopup(`Última posición: ${fmtFecha(p.time_index)}`);
 }
 
-refrescar();
+cargarEquipos()
+  .catch(e => { document.getElementById("error").textContent =
+                  `No se pudo leer la lista de equipos: ${e.message}`; })
+  .then(refrescar);
 setInterval(refrescar, 60000);
 matchMedia("(prefers-color-scheme: dark)").addEventListener("change", refrescar);
 </script>

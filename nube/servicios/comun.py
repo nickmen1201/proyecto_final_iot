@@ -12,6 +12,7 @@ import requests
 CRATE_URL = os.getenv("CRATE_URL", "http://crate-db:4200/_sql")
 TABLA_CRATE = os.getenv("TABLA_CRATE", "mtagricultura.etsensoragricola")
 ORION_URL = os.getenv("ORION_URL", "http://orion:1026")
+AGENTE_URL = os.getenv("AGENTE_URL", "http://iot-agent:4041")
 CABECERAS_FIWARE = {"fiware-service": "agricultura", "fiware-servicepath": "/"}
 
 _PG = dict(
@@ -45,18 +46,22 @@ def pg_conn():
     return psycopg.connect(**_PG, autocommit=True)
 
 
-def leer_crudas(desde_ms, limite=5000):
-    """Medidas de CrateDB posteriores a desde_ms (epoch ms), como dicts.
+def leer_crudas(desde_ms, hasta_ms, limite, recientes=False):
+    """Medidas de CrateDB con desde_ms < time_index <= hasta_ms, como dicts
+    en orden de tiempo. Si hay mas de 'limite', devuelve las mas viejas (para
+    procesar por lotes) o, con recientes=True, las mas nuevas.
 
     SELECT * a proposito: QuantumLeap crea las columnas (validez, latitud...)
     solo cuando llega el primer valor no nulo, asi que pedirlas por nombre
     fallaria mientras no existan.
     """
     cols, filas = crate_sql(
-        f"SELECT * FROM {TABLA_CRATE} WHERE time_index > ? "
-        f"ORDER BY time_index LIMIT {limite}",
-        [int(desde_ms)],
+        f"SELECT * FROM {TABLA_CRATE} WHERE time_index > ? AND time_index <= ? "
+        f"ORDER BY time_index {'DESC' if recientes else 'ASC'} LIMIT {limite}",
+        [int(desde_ms), int(hasta_ms)],
     )
+    if recientes:
+        filas.reverse()
     return [dict(zip(cols, fila)) for fila in filas]
 
 
@@ -115,7 +120,7 @@ def limpiar_medida(m, ultima_t):
 
 
 def contar_perdidas(enes):
-    """Tramas perdidas segun los huecos del contador n. Un n que baja es un
-    reinicio del emisor y no cuenta como perdida."""
-    enes = sorted(x for x in enes if x is not None)
-    return sum(max(0, b - a - 1) for a, b in zip(enes, enes[1:]))
+    """Tramas perdidas segun los huecos del contador n, con los n en orden de
+    llegada. Un n que baja es un reinicio del emisor y no cuenta."""
+    enes = [x for x in enes if x is not None]
+    return sum(b - a - 1 for a, b in zip(enes, enes[1:]) if b > a)

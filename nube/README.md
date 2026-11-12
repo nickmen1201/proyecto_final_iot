@@ -108,8 +108,8 @@ lo publica en la EC2 y el Security Group lo permite.
 | 80 / 443 | Front (Caddy) | Sí | **Hay que abrirlos**, `0.0.0.0/0` | El tablero web. El 80 solo redirige al 443 y responde el reto de Let's Encrypt. |
 | 5555 | IoT Agent | Sí | Sí, `0.0.0.0/0` | **Southbound**: entrada HTTP de medidas desde el gateway (`IOTA_HTTP_PORT`) |
 | 4200 | CrateDB | Sí | Solo `200.3.144.141/32` | API HTTP/SQL y consola web, donde se visualizan los datos |
-| 4041 | IoT Agent | Sí | **No** | **Northbound**: API de administración, para crear service groups y dispositivos (`IOTA_NORTH_PORT`) |
-| 1026 | Orion | Sí | **No** | API NGSI-v2: consultar y modificar entidades, crear suscripciones |
+| 4041 | IoT Agent | Solo en `127.0.0.1` | **No** | **Northbound**: API de administración, para crear service groups y dispositivos (`IOTA_NORTH_PORT`) |
+| 1026 | Orion | Solo en `127.0.0.1` | **No** | API NGSI-v2: consultar y modificar entidades, crear suscripciones |
 | 7896 | IoT Agent | No | No | Puerto HTTP por defecto de la imagen. No se usa porque se cambió a 5555. |
 | 27017 | MongoDB | No | No | Solo accesible dentro de la red `fiware_default` |
 | 8668 | QuantumLeap | No | No | Recibe notificaciones de Orion. Su API de consulta del histórico solo es accesible dentro de Docker. |
@@ -147,10 +147,13 @@ consultadas el 2026-10-21. La instancia no tiene rol de IAM.
   A cambio, el ancho de banda es bajo: máximo 255 bytes por paquete.
 - **Formato:** JSON compacto de una línea.
   ```json
-  {"id":"461879","n":12,"t":22.41,"h":61.30,"lat":6.245259,"lon":-75.596510}
+  {"id":"461879","n":12,"t":22.41,"h":61.30,"lat":6.245259,"lon":-75.596510,"v":3}
   ```
   Un dato inválido (sensor ausente o GPS sin fix) viaja como `null`, nunca
-  como `0`.
+  como `0`. `v` es la máscara de validez de la trama: bit 1 = aire (`t`/`h`),
+  bit 2 = GPS. Hace falta porque los `null` no llegan al histórico: el agente
+  los omite, Orion conserva el valor viejo y CrateDB guardaría ese valor
+  repetido como si fuera una medida nueva. Con `v`, Limpiar lo detecta.
 
 #### b) Gateway → IoT Agent: HTTP
 
@@ -165,7 +168,7 @@ consultadas el 2026-10-21. La instancia no tiene rol de IAM.
   POST http://34.237.180.187:5555/iot/json?k=<apikey>&i=461879
   Content-Type: application/json
 
-  {"n":12,"t":22.41,"h":61.30,"lat":6.245259,"lon":-75.596510,"rssi":-87,"snr":9.5}
+  {"n":12,"t":22.41,"h":61.30,"lat":6.245259,"lon":-75.596510,"v":3,"rssi":-87,"snr":9.5}
   ```
 - **Respuesta:** un código `2xx` saca la trama de la cola del gateway. Un
   `4xx` la descarta, porque reenviarla daría el mismo error. Un error de red o
@@ -187,6 +190,8 @@ consultadas el 2026-10-21. La instancia no tiene rol de IAM.
    | `lon` | `longitud` | `Number` | — (ver nota) |
    | `rssi` | `rssi` | `Integer` | `rssi` (bigint) |
    | `snr` | `snr` | `Number` | `snr` (real) |
+   | `v` | `validez` | `Integer` | `validez` (bigint) |
+   | `l`, `s` | `luz`, `humedadSuelo` | `Number` | Reservados para los sensores de luz y de suelo |
    | (lo agrega el agente) | `TimeInstant` | `DateTime` | `timeinstant` |
 
    `IOTA_AUTOCAST=true` hace que los valores viajen como números y no como
@@ -382,12 +387,16 @@ servicios son scripts de Python sobre una misma imagen
      frescos, R5 pasa a CRÍTICO y las demás dicen SIN_DATOS, nunca "todo bien".
      Los umbrales son los del tomate y viven en un diccionario
      ([`analitica.py`](servicios/analitica.py)).
-3. **API** expone `/api/decisiones`, `/api/indicadores`, `/api/resumen`,
-   `/api/medidas`, `/api/actual` (este último consulta a Orion, la línea de
-   retorno del tablero) y `/api/salud`.
-4. **Front**: [una sola página](front/index.html) con el semáforo R1–R5, las
+3. **API**, de solo lectura: `/api/decisiones`, `/api/indicadores`,
+   `/api/resumen`, `/api/medidas` (Postgres), `/api/actual` (consulta a
+   **Orion**), `/api/dispositivos` (consulta al **IoT Agent**) y `/api/salud`.
+   Las dos últimas consultas son las líneas de retorno del tablero: el front
+   llega a Orion y al Agente solo a través de la API, sin exponerlos.
+4. **Front**: [una sola página](front/index.html) con el selector de equipo
+   (los dispositivos registrados en el Agente), el semáforo R1–R5, las
    gráficas de T/punto de rocío y VPD con sus umbrales, el historial de
-   decisiones y el mapa. Caddy la sirve en 80/443 con certificado automático.
+   decisiones y el mapa. Avisa si las decisiones llevan más de 5 minutos sin
+   evaluarse. Caddy la sirve en 80/443 con certificado automático.
 
 Para probar sin hardware: [`simular.sh`](simular.sh) envía tramas como el
 gateway (dispositivo `simulado-01`, una entidad aparte) con escenarios que
@@ -420,15 +429,18 @@ del gateway.
 > El sensor no debe poder escribir directamente en Orion sin pasar por el
 > agente.
 
-**Se cumple con el Security Group.** Desde Internet solo están abiertos el
-5555, que es el IoT Agent, y el 22, que es SSH. El 1026 de Orion y el 4041 de
-administración del agente están cerrados. Así, lo único que puede hacer un
-dispositivo desde fuera es mandar medidas al agente, y es el agente, dentro de
-la red de Docker, quien escribe en Orion.
+**Se cumple con dos barreras.** La primera es Docker: el 1026 de Orion y el
+4041 de administración del agente se publican solo en `127.0.0.1` de la EC2
+(para `provisionamiento.sh`), así que no escuchan en la interfaz pública. La
+segunda es el Security Group, que tampoco los abre. Desde Internet solo
+entran el 5555 (IoT Agent), el 80/443 (front) y el 22 (SSH). Lo único que
+puede hacer un dispositivo desde fuera es mandar medidas al agente, y es el
+agente, dentro de la red de Docker, quien escribe en Orion. La API del front
+es de solo lectura.
 
 ```
 gateway --:5555--> IoT Agent --(red interna de Docker)--> Orion :1026
-gateway --:1026--> Orion        bloqueado por el Security Group
+gateway --:1026--> Orion        no publicado (solo 127.0.0.1) y cerrado en el SG
 ```
 
 El emisor ni siquiera tiene conexión a Internet: solo habla LoRa con el
@@ -455,9 +467,12 @@ curl -s -m 5 http://34.237.180.187:4041/iot/about || echo "Agente norte: bloquea
 - **22, SSH** está abierto a todo Internet. Solo se entra con la llave
   `vockey`, y la regla abierta es lo que permite usar EC2 Instance Connect
   desde el navegador.
-- Docker publica el 1026 y el 4041 en todas las interfaces de la EC2. Hoy lo
-  único que los protege es el Security Group: si alguien abriera esos puertos
-  ahí, quedarían expuestos.
+- **80/443, front** es público y no pide usuario: cualquiera con la URL ve
+  las medidas y las decisiones, pero no puede modificar nada.
+- **Arranque en frío:** si las dos primeras medidas de una plataforma nueva
+  llegan casi juntas, QuantumLeap puede perder la segunda mientras crea la
+  tabla en CrateDB (`SchemaUnknownException` en su log). Pasa una sola vez y
+  con el emisor real, que envía cada 10 s, no se da.
 
 ---
 
@@ -498,4 +513,4 @@ curl -s localhost:1026/v2/subscriptions -H "fiware-service: agricultura" -H "fiw
   subir el firmware del gateway.
 - **Montar la plataforma desde cero** (EC2 nueva): copiar
   `docker-compose.yml` a `~/fiware`, correr `docker compose up -d` y luego
-  [`provisionamiento.sh`](provisionamiento.sh) **una sola vez**.
+  [`provisionamiento.sh`](provisionamiento.sh). Repetirlo no duplica nada.
