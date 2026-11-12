@@ -361,6 +361,27 @@ curl -s localhost:1026/version       # ¿Orion responde?
 curl -s localhost:4041/iot/about     # ¿El IoT Agent responde?
 ```
 
+### Si no llegan datos nuevos a CrateDB
+
+Hay que revisar la cadena por tramos, del final hacia el principio. En la EC2:
+
+```bash
+cd ~/fiware
+# 1. ¿Orion recibe medidas? Se esperan unas 12 en 2 minutos.
+docker compose logs --since 2m --no-color orion | grep -c "POST /v2/entities"
+# 2. Si es 0: ¿llega algo al agente?
+docker compose logs --since 30m --no-color iot-agent | grep -v "iot/about" | grep -v "response-time" | tail -20
+# 3. Si Orion sí recibe: ¿la suscripción notifica?
+curl -s localhost:1026/v2/subscriptions -H "fiware-service: agricultura" -H "fiware-servicepath: /"
+```
+
+- Si el agente no recibe nada, el problema está en el gateway. Como no tiene
+  pantalla, hay que conectarlo al PC y abrir el monitor serial con
+  `pio device monitor -e gateway`. La causa más común es que la red WiFi
+  configurada en `secrets.h` no esté encendida.
+- No usar `docker compose logs -f` sin `--since`: primero imprime todo el
+  historial, y las medidas viejas parecen nuevas.
+
 - **Detener e iniciar la EC2:** todo vuelve solo. Si la IP pública llegara a
   cambiar, hay que actualizar `AGENTE_HOST` en `include/secrets.h` y volver a
   subir el firmware del gateway.
